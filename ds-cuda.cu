@@ -1,0 +1,1361 @@
+// Let ds(n) be the smallest prime number for which the digit sums
+// when written in bases 2 to n+1 are all prime.
+//
+// This program searches for ds(n) numbers.
+//
+// The GPU is used identify candidate numbers by:
+// 1. Using a mod-30 prime wheel to reject any number that is a
+//    multiple of 2, 3 or 5 (this rejects 73.33% of candidates)
+// 2. Checking if the digit sums are prime in the following
+//    bases in this order: (powers of two) 2, 4, 16, 8, 32,
+//                         (even bases)    12, 6, 10,
+//				   (odd bases)     5, 9, 3, 11, 7
+// The powers of two use popcount instructions with a small
+// prime lookup array.
+// The even and odd bases use radix chunking narrowing to
+// minimize 64bit calculations and the constant divisions
+// are replaced by the compiler.
+// Empircal testing showed that even bases filter more candidates
+// than odd bases and also provided the optimal base order.
+//
+// The GPU has two kernels so while one is sending back results
+// the other is processing the next block of candidates in
+// parallel.
+//
+// An RTX4070 GPU processes around 660 billion candidates per
+// second. The GPU is given a block of 2 trillion numbers to
+// check which is does in about 3 seconds.
+//
+// The filtering on the GPU typically results in about 1 in 2 million
+// surviving candidates being returned which for the block size
+// is 1 million survivors.
+// These are checked by a CPU verification worker thread which takes
+// around 50ms on a single thread on an AMD3950X.
+//
+// Results are appended to 'ds-records.txt'.
+// A progress heartbeat is written to 'ds-state.txt' every minute
+// containing the command to restart from the last heartbeat.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <inttypes.h>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <atomic>
+#include <vector>
+#include <chrono>
+#include <time.h>
+#include <string>
+#include <cuda_runtime.h>
+
+// Helper function to format large integers with commas
+std::string formatCommas(uint64_t num)
+{
+	std::string s = std::to_string(num);
+	int insertPosition = s.length() - 3;
+	while (insertPosition > 0)
+	{
+		s.insert(insertPosition, ",");
+		insertPosition -= 3;
+	}
+	return s;
+}
+
+// Block size on the GPU
+#define BLOCK_SIZE 768
+
+// Maximum number of candidates returned by the GPU
+#define MAX_GPU_RESULTS 20000000ULL
+
+#define CUDA_CHECK(call)                                                           \
+	do                                                                           \
+	{                                                                            \
+		cudaError_t err = (call);                                              \
+		if (err != cudaSuccess)                                                \
+		{                                                                      \
+			fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, \
+				  cudaGetErrorString(err));                                \
+			exit(EXIT_FAILURE);                                              \
+		}                                                                      \
+	} while (0)
+
+// --- Host Verification ---
+static uint64_t mulmod(uint64_t a, uint64_t b, uint64_t n)
+{
+	uint64_t high, low, remainder;
+	low = _umul128(a, b, &high);
+	_udiv128(high, low, n, &remainder);
+	return remainder;
+}
+
+static uint64_t powmod(uint64_t a, uint64_t r, uint64_t n)
+{
+	uint64_t x = 1;
+	while (r != 0)
+	{
+		if (r & 1)
+			x = mulmod(a, x, n);
+		a = mulmod(a, a, n);
+		r >>= 1;
+	}
+	return x;
+}
+
+static int spsp(uint64_t n, uint64_t p)
+{
+	uint64_t x;
+	uint64_t r = n - 1;
+	int k = 0;
+	while ((r & 1) == 0)
+	{
+		k++;
+		r >>= 1;
+	}
+	x = powmod(p, r, n);
+	if (x == 1)
+		return 1;
+	while (k > 0)
+	{
+		if (x == n - 1)
+			return 1;
+		x = mulmod(x, x, n);
+		k--;
+	}
+	return 0;
+}
+
+int cpu_isPrime(uint64_t n)
+{
+	if (n < 2ULL)
+		return 0;
+
+	// Quick-pass known small primes
+	if (n == 2ULL || n == 3ULL || n == 5ULL || n == 7ULL ||
+	    n == 11ULL || n == 13ULL || n == 17ULL || n == 19ULL ||
+	    n == 23ULL || n == 29ULL || n == 31ULL || n == 37ULL)
+		return 1;
+
+	// Fast hardware modulus to weed out 50%+ of composites
+	if ((n & 1) == 0 || n % 3 == 0 || n % 5 == 0 || n % 7 == 0 ||
+	    n % 11 == 0 || n % 13 == 0 || n % 17 == 0 || n % 19 == 0 ||
+	    n % 23 == 0 || n % 29 == 0 || n % 31 == 0 || n % 37 == 0)
+		return 0;
+
+	if (!spsp(n, 2))
+		return 0;
+	if (n < 2047ULL)
+		return 1;
+	if (!spsp(n, 3))
+		return 0;
+	if (n < 1373653ULL)
+		return 1;
+	if (!spsp(n, 5))
+		return 0;
+	if (n < 25326001ULL)
+		return 1;
+	if (!spsp(n, 7))
+		return 0;
+	if (n < 3215031751ULL)
+		return 1;
+	if (!spsp(n, 11))
+		return 0;
+	if (n < 2152302898747ULL)
+		return 1;
+	if (!spsp(n, 13))
+		return 0;
+	if (n < 3474749660383ULL)
+		return 1;
+	if (!spsp(n, 17))
+		return 0;
+	if (n < 341550071728321ULL)
+		return 1;
+	if (!spsp(n, 19))
+		return 0;
+	if (!spsp(n, 23))
+		return 0;
+	if (n < 3825123056546413051ULL)
+		return 1;
+	if (!spsp(n, 29) || !spsp(n, 31) || !spsp(n, 37))
+		return 0;
+	return 1;
+}
+
+uint64_t sumDigits(uint64_t value, const uint32_t radix)
+{
+	uint64_t sum = 0;
+	while (value > 0)
+	{
+		sum += value % radix;
+		value /= radix;
+	}
+	return sum;
+}
+
+// 1. The Templated (Compile-Time) version of sumDigits
+template <uint32_t RADIX>
+inline uint64_t sumDigitsConst(uint64_t value)
+{
+	uint64_t sum = 0;
+	while (value > 0)
+	{
+		sum += value % RADIX;
+		value /= RADIX;
+	}
+	return sum;
+}
+
+// 2. The Router to force compile-time evaluation
+inline uint64_t sumDigitsFast(uint64_t value, uint32_t radix)
+{
+	switch (radix)
+	{
+	case 2:
+		return sumDigitsConst<2>(value);
+	case 3:
+		return sumDigitsConst<3>(value);
+	case 4:
+		return sumDigitsConst<4>(value);
+	case 5:
+		return sumDigitsConst<5>(value);
+	case 6:
+		return sumDigitsConst<6>(value);
+	case 7:
+		return sumDigitsConst<7>(value);
+	case 8:
+		return sumDigitsConst<8>(value);
+	case 9:
+		return sumDigitsConst<9>(value);
+	case 10:
+		return sumDigitsConst<10>(value);
+	case 11:
+		return sumDigitsConst<11>(value);
+	case 12:
+		return sumDigitsConst<12>(value);
+	case 13:
+		return sumDigitsConst<13>(value);
+	case 14:
+		return sumDigitsConst<14>(value);
+	case 15:
+		return sumDigitsConst<15>(value);
+	case 16:
+		return sumDigitsConst<16>(value);
+	case 17:
+		return sumDigitsConst<17>(value);
+	case 18:
+		return sumDigitsConst<18>(value);
+	case 19:
+		return sumDigitsConst<19>(value);
+	case 20:
+		return sumDigitsConst<20>(value);
+	case 21:
+		return sumDigitsConst<21>(value);
+	case 22:
+		return sumDigitsConst<22>(value);
+	case 23:
+		return sumDigitsConst<23>(value);
+	case 24:
+		return sumDigitsConst<24>(value);
+	case 25:
+		return sumDigitsConst<25>(value);
+	case 26:
+		return sumDigitsConst<26>(value);
+	case 27:
+		return sumDigitsConst<27>(value);
+	case 28:
+		return sumDigitsConst<28>(value);
+	case 29:
+		return sumDigitsConst<29>(value);
+	case 30:
+		return sumDigitsConst<30>(value);
+	case 31:
+		return sumDigitsConst<31>(value);
+	case 32:
+		return sumDigitsConst<32>(value);
+	case 33:
+		return sumDigitsConst<33>(value);
+	case 34:
+		return sumDigitsConst<34>(value);
+	case 35:
+		return sumDigitsConst<35>(value);
+	case 36:
+		return sumDigitsConst<36>(value);
+	case 37:
+		return sumDigitsConst<37>(value);
+	case 38:
+		return sumDigitsConst<38>(value);
+	case 39:
+		return sumDigitsConst<39>(value);
+	case 40:
+		return sumDigitsConst<40>(value);
+	default:
+		return sumDigits(value, radix); // Fallback to slow division if base > 40
+	}
+}
+
+struct BufferBundle
+{
+	uint64_t *memory;
+	cudaEvent_t ready_event;
+};
+
+struct ComputePayload
+{
+	BufferBundle bundle;
+	uint32_t candidate_count;
+	uint64_t raw_start_range;
+	uint64_t subblock_id;
+	uint32_t kernel_minbase;
+};
+
+std::queue<ComputePayload> verification_queue;
+std::mutex queue_mutex;
+std::condition_variable queue_cv;
+bool engine_running = true;
+
+std::atomic<uint32_t> global_minbase{0};
+std::atomic<bool> global_target_achieved{false};
+uint8_t *global_smallprimes;
+
+constexpr int POOL_SIZE = 4;
+uint64_t *h_buffer_pool[POOL_SIZE];
+
+std::queue<BufferBundle> free_buffers;
+std::mutex pool_mutex;
+std::condition_variable pool_cv;
+
+std::mutex file_mutex; // Protects file I/O
+
+void logRecord(uint32_t base, uint64_t candidate)
+{
+	std::lock_guard<std::mutex> lock(file_mutex);
+
+	// Convert the candidate number into a comma-separated string
+	std::string formatted_candidate = formatCommas(candidate);
+
+	// Output to screen
+	printf(">>> NEW RECORD FOUND: ds(%u) = %s <<<\n", base, formatted_candidate.c_str());
+	fflush(stdout);
+
+	// Append to file
+	FILE *f = fopen("ds_records.txt", "a");
+	if (f != NULL)
+	{
+		fprintf(f, ">>> NEW RECORD FOUND: ds(%u) = %s <<<\n", base, formatted_candidate.c_str());
+		fclose(f);
+	}
+}
+
+void saveHeartbeatState(uint64_t completed_block, uint32_t current_base)
+{
+	std::lock_guard<std::mutex> lock(file_mutex);
+
+	// Open in overwrite mode ("w") so it only stores the latest state
+	FILE *f = fopen("ds_state.txt", "w");
+	if (f != NULL)
+	{
+		time_t rawtime;
+		struct tm *timeinfo;
+		char buffer[80];
+		time(&rawtime);
+		timeinfo = localtime(&rawtime);
+		strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+
+		fprintf(f, "--- ENGINE HEARTBEAT ---\n");
+		fprintf(f, "Last Saved: %s\n", buffer);
+		fprintf(f, "Restart Command Args:\n");
+		// Print the exact arguments you need to paste into the terminal to resume
+		fprintf(f, ".\\ds %" PRIu64 " <end_subblock> <subblock_size> %u <maxbase>\n", completed_block + 1, current_base);
+		fclose(f);
+	}
+}
+
+// 48 offsets coprime to 2, 3, 5, and 7
+__device__ const uint8_t d_wheel_210[48] = {
+    1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 
+    71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 121, 127, 131, 
+    137, 139, 143, 149, 151, 157, 163, 167, 169, 173, 179, 181, 187, 
+    191, 193, 197, 199, 209
+};
+
+// This is the GPU kernel that filters candidate numbers
+template <uint32_t MIN_BASE>
+__global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
+    uint64_t start_range, uint64_t total_numbers,
+    const uint8_t *__restrict__ g_sp, uint32_t sp_size,
+    uint64_t *__restrict__ d_results, uint32_t *__restrict__ d_count,
+    const uint8_t *__restrict__ b3, const uint8_t *__restrict__ b5,
+    const uint8_t *__restrict__ b6, const uint8_t *__restrict__ b7,
+    const uint8_t *__restrict__ b9, const uint8_t *__restrict__ b10,
+    const uint8_t *__restrict__ b11, const uint8_t *__restrict__ b12)
+{
+
+	//uint64_t global_tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+	//uint64_t total_threads = (uint64_t)gridDim.x * blockDim.x;
+	uint32_t lane_id = threadIdx.x & 31;
+
+	// --- SHARED MEMORY ALLOCATION BLOCK ---
+	extern __shared__ uint8_t s_mem[];
+	uint8_t *s_sp = s_mem;
+	uint8_t *s_b3 = s_sp + sp_size;
+	uint8_t *s_b5 = s_b3 + 6561;
+	uint8_t *s_b6 = s_b5 + 15625;
+	uint8_t *s_b7 = s_b6 + 1296;
+	uint8_t *s_b9 = s_b7 + 2401;
+	uint8_t *s_b10 = s_b9 + 6561;
+
+	// Collaboratively load tables into ultra-fast L1 Shared Memory
+	for (uint32_t i = threadIdx.x; i < sp_size; i += blockDim.x)
+		s_sp[i] = g_sp[i];
+	for (uint32_t i = threadIdx.x; i < 6561; i += blockDim.x)
+		s_b3[i] = b3[i];
+	for (uint32_t i = threadIdx.x; i < 15625; i += blockDim.x)
+		s_b5[i] = b5[i];
+	for (uint32_t i = threadIdx.x; i < 1296; i += blockDim.x)
+		s_b6[i] = b6[i];
+	for (uint32_t i = threadIdx.x; i < 2401; i += blockDim.x)
+		s_b7[i] = b7[i];
+	for (uint32_t i = threadIdx.x; i < 6561; i += blockDim.x)
+		s_b9[i] = b9[i];
+	for (uint32_t i = threadIdx.x; i < 10000; i += blockDim.x)
+		s_b10[i] = b10[i];
+
+	__syncthreads();
+
+	uint64_t end_range = start_range + total_numbers;
+	const uint64_t PRIME_MASK_64 = 0x28208A20A08A28ACULL;
+
+	// Calculated exactly ONCE per thread
+	uint32_t wheel_idx = threadIdx.x % 48;       // Fast 32-bit math
+	uint32_t cycle_in_block = threadIdx.x / 48;
+    
+	// Each block processes 16 full wheels (16 * 210 = 3360 numbers span)
+	uint64_t cycle = (uint64_t)blockIdx.x * 16ULL + cycle_in_block;
+    
+	// Start range logic
+	uint64_t candidate = start_range + (cycle * 210ULL) + __ldg(&d_wheel_210[wheel_idx]);
+    
+	// The stride is simply the total grid span
+	uint64_t stride = (uint64_t)gridDim.x * 16ULL * 210ULL;
+
+	while (candidate < end_range)
+	{
+		bool pass = false;
+
+		do
+		{	
+			// Base 2
+			uint32_t p = __popcll(candidate);
+			// hack: shift by 64 means shift by 0 and the 0th bit of PRIME_MASK_64 is 0.
+			// therefore the bitwise check evaluates to false and correctly rejects the number.
+			// if (p >= 64 || !((PRIME_MASK_64 >> p) & 1ULL)) break;
+			if (!((PRIME_MASK_64 >> p) & 1ULL))
+				break;
+
+			// Base 4
+			uint32_t ds4 = p + __popcll(candidate & 0xAAAAAAAAAAAAAAAAULL);
+			if (!s_sp[ds4])
+				break;
+
+			// Base 16
+			if constexpr (MIN_BASE >= 16)
+			{
+				uint64_t ds16_64 = (candidate & 0x0F0F0F0F0F0F0F0FULL) + ((candidate >> 4) & 0x0F0F0F0F0F0F0F0FULL);
+				uint32_t ds16 = (uint32_t)((ds16_64 * 0x0101010101010101ULL) >> 56);
+				if (!s_sp[ds16])
+					break;
+			}
+
+			// Base 8
+			uint32_t ds8 = __popcll(candidate & 0x9249249249249249ULL) +
+					   (__popcll(candidate & 0x2492492492492492ULL) << 1) +
+					   (__popcll(candidate & 0x4924924924924924ULL) << 2);
+			if (!s_sp[ds8])
+				break;
+
+			// Base 32 digit sum via 5-bit interleaved population counts
+			if constexpr (MIN_BASE >= 32)
+			{
+				uint32_t ds32 =
+				    __popcll(candidate & 0x1084210842108421ULL) +
+				    (__popcll(candidate & 0x2108421084210842ULL) << 1) +
+				    (__popcll(candidate & 0x4210842108421084ULL) << 2) +
+				    (__popcll(candidate & 0x8421084210842108ULL) << 3) +
+				    (__popcll(candidate & 0x0842108421084210ULL) << 4);
+
+				if (!s_sp[ds32])
+					break;
+			}
+
+			uint32_t sum, r, rq;
+			uint64_t r64, rq64;
+			uint64_t v_hi;
+			uint32_t v_low;
+
+			// --- Base 12 (left in Global memory) ---
+			if constexpr (MIN_BASE >= 12)
+			{
+				v_hi = candidate / 429981696ULL;
+				v_low = (uint32_t)(candidate - v_hi * 429981696ULL);
+				sum = 0;
+				r64 = v_hi;
+				rq64 = r64 / 20736ULL;
+				sum += b12[r64 - rq64 * 20736ULL];
+				r64 = rq64;
+				r = (uint32_t)r64;
+				rq = r / 20736U;
+				sum += b12[r - rq * 20736U];
+				r = rq;
+				sum += b12[r];
+				r = v_low;
+				rq = r / 20736U;
+				sum += b12[r - rq * 20736U];
+				r = rq;
+				sum += b12[r];
+				if (!s_sp[sum])
+					break;
+			}
+
+			// --- Base 6 ---
+			v_hi = candidate / 2176782336ULL;
+			v_low = (uint32_t)(candidate - v_hi * 2176782336ULL);
+			sum = 0;
+
+			r64 = v_hi;
+			rq64 = r64 / 1296ULL;
+			sum += s_b6[r64 - rq64 * 1296ULL];
+			r64 = rq64;
+			r = (uint32_t)r64;
+			rq = r / 1296U;
+			sum += s_b6[r - rq * 1296U];
+			r = rq;
+			rq = r / 1296U;
+			sum += s_b6[r - rq * 1296U];
+			r = rq;
+			sum += s_b6[r];
+
+			r = v_low;
+			rq = r / 1296U;
+			sum += s_b6[r - rq * 1296U];
+			r = rq;
+			rq = r / 1296U;
+			sum += s_b6[r - rq * 1296U];
+			r = rq;
+			sum += s_b6[r];
+			if (!s_sp[sum])
+				break;
+
+			// --- Base 10 ---
+			if constexpr (MIN_BASE >= 10)
+			{
+				v_hi = candidate / 1000000000ULL;
+				v_low = (uint32_t)(candidate - v_hi * 1000000000ULL);
+				sum = 0;
+
+				r64 = v_hi;
+				rq64 = r64 / 10000ULL;
+				sum += s_b10[r64 - rq64 * 10000ULL];
+				r64 = rq64;
+				r = (uint32_t)r64;
+				rq = r / 10000U;
+				sum += s_b10[r - rq * 10000U];
+				r = rq;
+				sum += s_b10[r];
+
+				r = v_low;
+				rq = r / 10000U;
+				sum += s_b10[r - rq * 10000U];
+				r = rq;
+				rq = r / 10000U;
+				sum += s_b10[r - rq * 10000U];
+				r = rq;
+				sum += s_b10[r];
+				if (!s_sp[sum])
+					break;
+			}
+
+			// --- Base 5 ---
+			v_hi = candidate / 244140625ULL;
+			v_low = (uint32_t)(candidate - v_hi * 244140625ULL);
+			sum = 0;
+
+			r64 = v_hi;
+			rq64 = r64 / 15625ULL;
+			sum += s_b5[r64 - rq64 * 15625ULL];
+			r64 = rq64;
+
+			r = (uint32_t)r64;
+			rq = r / 15625U;
+			sum += s_b5[r - rq * 15625U];
+			r = rq;
+			sum += s_b5[r];
+
+			r = v_low;
+			rq = r / 15625U;
+			sum += s_b5[r - rq * 15625U];
+			r = rq;
+			sum += s_b5[r];
+			if (!s_sp[sum])
+				break;
+
+			// --- Base 9 ---
+			v_hi = candidate / 3486784401ULL;
+			v_low = (uint32_t)(candidate - v_hi * 3486784401ULL);
+			sum = 0;
+
+			r64 = v_hi;
+			rq64 = r64 / 6561ULL;
+			sum += s_b9[r64 - rq64 * 6561ULL];
+			r64 = rq64;
+			r = (uint32_t)r64;
+			rq = r / 6561U;
+			sum += s_b9[r - rq * 6561U];
+			r = rq;
+			sum += s_b9[r];
+
+			r = v_low;
+			rq = r / 6561U;
+			sum += s_b9[r - rq * 6561U];
+			r = rq;
+			rq = r / 6561U;
+			sum += s_b9[r - rq * 6561U];
+			r = rq;
+			sum += s_b9[r];
+			if (!s_sp[sum])
+				break;
+
+			// --- Base 3 ---
+			v_hi = candidate / 43046721ULL;
+			v_low = (uint32_t)(candidate - v_hi * 43046721ULL);
+			sum = 0;
+
+			r64 = v_hi;
+			rq64 = r64 / 6561ULL;
+			sum += s_b3[r64 - rq64 * 6561ULL];
+			r64 = rq64;
+
+			r = (uint32_t)r64;
+			rq = r / 6561U;
+			sum += s_b3[r - rq * 6561U];
+			r = rq;
+			rq = r / 6561U;
+			sum += s_b3[r - rq * 6561U];
+			r = rq;
+			sum += s_b3[r];
+
+			r = v_low;
+			rq = r / 6561U;
+			sum += s_b3[r - rq * 6561U];
+			r = rq;
+			sum += s_b3[r];
+			if (!s_sp[sum])
+				break;
+
+			// --- Base 11 (left in Global Memory) ---
+			if constexpr (MIN_BASE >= 11)
+			{
+				v_hi = candidate / 2357947691ULL;
+				v_low = (uint32_t)(candidate - v_hi * 2357947691ULL);
+				sum = 0;
+				r64 = v_hi;
+				rq64 = r64 / 14641ULL;
+				sum += b11[r64 - rq64 * 14641ULL];
+				r64 = rq64;
+				r = (uint32_t)r64;
+				rq = r / 14641U;
+				sum += b11[r - rq * 14641U];
+				r = rq;
+				sum += b11[r];
+				r = v_low;
+				rq = r / 14641U;
+				sum += b11[r - rq * 14641U];
+				r = rq;
+				rq = r / 14641U;
+				sum += b11[r - rq * 14641U];
+				r = rq;
+				sum += b11[r];
+				if (!s_sp[sum])
+					break;
+			}
+
+			// --- Base 7 ---
+			v_hi = candidate / 1977326743ULL;
+			v_low = (uint32_t)(candidate - v_hi * 1977326743ULL);
+			sum = 0;
+
+			r64 = v_hi;
+			rq64 = r64 / 2401ULL;
+			sum += s_b7[r64 - rq64 * 2401ULL];
+			r64 = rq64;
+			r = (uint32_t)r64;
+			rq = r / 2401U;
+			sum += s_b7[r - rq * 2401U];
+			r = rq;
+			sum += s_b7[r];
+
+			r = v_low;
+			rq = r / 2401U;
+			sum += s_b7[r - rq * 2401U];
+			r = rq;
+			rq = r / 2401U;
+			sum += s_b7[r - rq * 2401U];
+			r = rq;
+			sum += s_b7[r];
+			if (!s_sp[sum])
+				break;
+
+			// If we successfully run the gauntlet without breaking:
+			pass = true;
+		} while (0);
+
+		uint32_t warp_mask = __ballot_sync(0xFFFFFFFF, pass);
+		if (warp_mask)
+		{
+			uint32_t warp_count = __popc(warp_mask);
+			uint32_t base_idx = 0;
+
+			if (lane_id == 0)
+			{
+				base_idx = atomicAdd(d_count, warp_count);
+			}
+			base_idx = __shfl_sync(0xFFFFFFFF, base_idx, 0);
+
+			uint32_t local_offset = __popc(warp_mask & ((1u << lane_id) - 1));
+			if (pass && base_idx + local_offset < MAX_GPU_RESULTS)
+			{
+				d_results[base_idx + local_offset] = candidate;
+			}
+		}
+
+		candidate += stride;
+	}
+}
+
+// CPU verification worker that checks surviving candidates from the GPU filtering
+void verificationWorker(uint32_t max_target_base)
+{
+	auto last_heartbeat_time = std::chrono::steady_clock::now();
+	const std::chrono::seconds HEARTBEAT_INTERVAL(60); // Heartbeat interval is 60 seconds
+
+	while (true)
+	{
+		ComputePayload task;
+		{
+			std::unique_lock<std::mutex> lock(queue_mutex);
+			queue_cv.wait(lock, []
+					  { return !verification_queue.empty() || !engine_running; });
+
+			if (!engine_running && verification_queue.empty())
+				break;
+
+			task = verification_queue.front();
+			verification_queue.pop();
+		}
+
+		// THE BARRIER: Wait for the DMA transfer to physically finish across the PCIe bus
+		CUDA_CHECK(cudaEventSynchronize(task.bundle.ready_event));
+
+		auto start_time = std::chrono::high_resolution_clock::now();
+		size_t survivor_count = 0;
+
+		if (task.candidate_count > 0)
+		{
+			std::vector<uint64_t> survivors;
+			uint32_t current_needed = global_minbase.load();
+			uint32_t max_fast_check = std::min(current_needed, max_target_base);
+
+			// ---------------------------------------------------------
+			// BUILD THE DYNAMIC CHECKLIST (Handles non-sequential gaps)
+			// ---------------------------------------------------------
+			uint8_t bases_to_check[64];
+			uint32_t check_count = 0;
+
+			for (uint32_t b = 2; b <= max_fast_check; ++b)
+			{
+				bool checked_by_gpu = false;
+
+				// Only assume the GPU checked it if it was within the kernel's target scope
+				if (b <= task.kernel_minbase)
+				{
+					// SWAR Bases handled by Ada Lovelace integer ALUs
+					if (b == 2 || b == 4 || b == 8 || b == 16 || b == 32)
+						checked_by_gpu = true;
+
+					// Modulo Bases handled by GPU (Notice 7 and 11 are missing)
+					if (b == 3 || b == 5 || b == 6 || b == 7 || b == 9 || b == 10 || b == 11 || b == 12)
+						checked_by_gpu = true;
+				}
+
+				if (!checked_by_gpu)
+				{
+					bases_to_check[check_count++] = b;
+				}
+			}
+
+			// 1. Initial array pre-filter based on the block's launch state
+			for (uint32_t i = 0; i < task.candidate_count; i++)
+			{
+				uint64_t candidate = task.bundle.memory[i];
+				if (candidate < task.raw_start_range)
+					continue;
+
+				bool survived = true;
+
+				// Un-branched, sequentially accessed L1 cache loop
+				for (uint32_t c = 0; c < check_count; ++c)
+				{
+					uint32_t b = bases_to_check[c];
+					if (!global_smallprimes[sumDigitsFast(candidate, b)])
+					{
+						survived = false;
+						break;
+					}
+				}
+
+				if (survived)
+					survivors.push_back(candidate);
+			}
+
+			survivor_count = survivors.size();
+			std::sort(survivors.begin(), survivors.end());
+
+			// 2. The Dynamic Record Hunt
+			for (uint64_t candidate : survivors)
+			{
+				uint32_t current_expected = global_minbase.load();
+				if (current_expected > max_target_base)
+					break;
+
+				bool ds_valid = true;
+
+				// Because of our dynamic checklist in Loop 1, we know with 100% certainty
+				// that everything up to max_fast_check is fully validated.
+				uint32_t highest_checked = max_fast_check;
+
+				// If the engine has advanced since this block was launched,
+				// catch up on the missing fast digit sum checks FIRST.
+				if (current_expected > highest_checked)
+				{
+					for (uint32_t r = highest_checked + 1; r <= current_expected; r++)
+					{
+						if (!global_smallprimes[sumDigitsFast(candidate, r)])
+						{
+							ds_valid = false;
+							break;
+						}
+					}
+					if (!ds_valid)
+						continue; // Fast Rejection! CPU primality test bypassed.
+					highest_checked = current_expected;
+				}
+				// ------------------------
+
+				// Candidate satisfies all bases up to current_expected. Now do the heavy math.
+				if (!cpu_isPrime(candidate))
+					continue;
+
+				// It's prime! Claim any records we just validated.
+				uint32_t claim_base = global_minbase.load();
+				while (claim_base <= highest_checked && claim_base <= max_target_base)
+				{
+					if (global_minbase.compare_exchange_weak(claim_base, claim_base + 1))
+					{
+						logRecord(claim_base - 1, candidate);
+						if (claim_base >= max_target_base)
+						{
+							global_target_achieved.store(true);
+							break;
+						}
+						claim_base++;
+					}
+				}
+				if (global_target_achieved.load())
+					break;
+
+				// Continue checking higher bases for this specific candidate
+				uint32_t next_r = highest_checked + 1;
+				while (next_r <= max_target_base)
+				{
+					if (!global_smallprimes[sumDigitsFast(candidate, next_r)])
+						break;
+
+					claim_base = global_minbase.load();
+					while (claim_base <= next_r && claim_base <= max_target_base)
+					{
+						if (global_minbase.compare_exchange_weak(claim_base, claim_base + 1))
+						{
+							logRecord(claim_base - 1, candidate);
+							if (claim_base >= max_target_base)
+							{
+								global_target_achieved.store(true);
+								break;
+							}
+							claim_base++;
+						}
+					}
+					if (global_target_achieved.load())
+						break;
+					next_r++;
+				}
+			}
+		}
+
+		auto end_time = std::chrono::high_resolution_clock::now();
+		std::chrono::duration<double, std::milli> elapsed = end_time - start_time;
+
+		std::string formatted_subblock = formatCommas(task.subblock_id + 1);
+		std::string formatted_candidate_count = formatCommas(task.candidate_count);
+		std::string formatted_survivor_count = formatCommas(survivor_count);
+
+		printf("Next is ds(%u): Sub-Block %s had %s candidates, %s survivors (processing time: %.2f ms)\n",
+			 global_minbase.load() - 1, formatted_subblock.c_str(), formatted_candidate_count.c_str(), formatted_survivor_count.c_str(), elapsed.count());
+		fflush(stdout);
+
+		// Heartbeat to save state at regular intervals
+		auto current_time = std::chrono::steady_clock::now();
+		if (std::chrono::duration_cast<std::chrono::seconds>(current_time - last_heartbeat_time) >= HEARTBEAT_INTERVAL)
+		{
+			saveHeartbeatState(task.subblock_id, global_minbase.load());
+			last_heartbeat_time = current_time;
+		}
+
+		// Return the buffer and event bundle to the pool for the GPU to reuse
+		{
+			std::lock_guard<std::mutex> lock(pool_mutex);
+			free_buffers.push(task.bundle);
+		}
+		pool_cv.notify_one();
+	}
+}
+
+// Main entry point
+int main(int argc, char **argv)
+{
+	if (argc != 6)
+	{
+		fprintf(stderr, "Usage: %s start_subblock end_subblock subblock_size minbase maxbase\n", argv[0]);
+		exit(EXIT_FAILURE);
+	}
+
+	CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+
+	uint64_t start_block = strtoull(argv[1], NULL, 10);
+	uint64_t end_block = strtoull(argv[2], NULL, 10);
+	uint64_t block_size = strtoull(argv[3], NULL, 10);
+
+	global_minbase.store(strtoul(argv[4], NULL, 10));
+	uint32_t max_target_base = strtoul(argv[5], NULL, 10);
+
+	uint32_t largestds = 65 * (max_target_base - 1);
+	uint32_t sp_bytes = largestds + 1;
+	if (sp_bytes < 155)
+		sp_bytes = 155;
+	sp_bytes = (sp_bytes + 3) & ~3;
+
+	global_smallprimes = (uint8_t *)calloc(sp_bytes, sizeof(uint8_t));
+	for (uint32_t i = 0; i <= largestds; i++)
+		global_smallprimes[i] = cpu_isPrime(i) ? 1 : 0;
+
+	// The widened Base 3 and Base 5 CPU generation
+	uint8_t h_base3[6561];
+	for (int i = 0; i < 6561; i++)
+		h_base3[i] = sumDigits(i, 3);
+	uint8_t h_base5[15625];
+	for (int i = 0; i < 15625; i++)
+		h_base5[i] = sumDigits(i, 5);
+
+	uint8_t h_base6[1296];
+	for (int i = 0; i < 1296; i++)
+		h_base6[i] = sumDigits(i, 6);
+	uint8_t h_base7[2401];
+	for (int i = 0; i < 2401; i++)
+		h_base7[i] = sumDigits(i, 7);
+	uint8_t h_base9[6561];
+	for (int i = 0; i < 6561; i++)
+		h_base9[i] = sumDigits(i, 9);
+	uint8_t h_base10[10000];
+	for (int i = 0; i < 10000; i++)
+		h_base10[i] = sumDigits(i, 10);
+	uint8_t h_base11[14641];
+	for (int i = 0; i < 14641; i++)
+		h_base11[i] = sumDigits(i, 11);
+	uint8_t h_base12[20736];
+	for (int i = 0; i < 20736; i++)
+		h_base12[i] = sumDigits(i, 12);
+
+	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12;
+	CUDA_CHECK(cudaMalloc((void **)&d_sp, sp_bytes));
+	CUDA_CHECK(cudaMalloc((void **)&d_b3, 6561));  // Expanded allocation
+	CUDA_CHECK(cudaMalloc((void **)&d_b5, 15625)); // Expanded allocation
+	CUDA_CHECK(cudaMalloc((void **)&d_b6, 1296));
+	CUDA_CHECK(cudaMalloc((void **)&d_b7, 2401));
+	CUDA_CHECK(cudaMalloc((void **)&d_b9, 6561));
+	CUDA_CHECK(cudaMalloc((void **)&d_b10, 10000));
+	CUDA_CHECK(cudaMalloc((void **)&d_b11, 14641));
+	CUDA_CHECK(cudaMalloc((void **)&d_b12, 20736));
+
+	CUDA_CHECK(cudaMemcpy(d_sp, global_smallprimes, sp_bytes, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b3, h_base3, 6561, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b5, h_base5, 15625, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b6, h_base6, 1296, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b7, h_base7, 2401, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b9, h_base9, 6561, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b10, h_base10, 10000, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b11, h_base11, 14641, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b12, h_base12, 20736, cudaMemcpyHostToDevice));
+
+	uint64_t *d_results_A, *d_results_B;
+	uint32_t *d_count_A, *d_count_B;
+	CUDA_CHECK(cudaMalloc((void **)&d_results_A, MAX_GPU_RESULTS * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMalloc((void **)&d_results_B, MAX_GPU_RESULTS * sizeof(uint64_t)));
+	CUDA_CHECK(cudaMalloc((void **)&d_count_A, sizeof(uint32_t)));
+	CUDA_CHECK(cudaMalloc((void **)&d_count_B, sizeof(uint32_t)));
+
+	uint32_t *h_count_A, *h_count_B;
+	CUDA_CHECK(cudaHostAlloc((void **)&h_count_A, sizeof(uint32_t), cudaHostAllocDefault));
+	CUDA_CHECK(cudaHostAlloc((void **)&h_count_B, sizeof(uint32_t), cudaHostAllocDefault));
+
+	cudaStream_t stream_A, stream_B;
+	CUDA_CHECK(cudaStreamCreate(&stream_A));
+	CUDA_CHECK(cudaStreamCreate(&stream_B));
+
+	cudaStream_t stream_transfer;
+	CUDA_CHECK(cudaStreamCreate(&stream_transfer));
+
+	for (int i = 0; i < POOL_SIZE; i++)
+	{
+		CUDA_CHECK(cudaHostAlloc((void **)&h_buffer_pool[i], MAX_GPU_RESULTS * sizeof(uint64_t), cudaHostAllocDefault));
+
+		cudaEvent_t event;
+		CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+		free_buffers.push({h_buffer_pool[i], event});
+	}
+
+	int numSMs;
+	CUDA_CHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0));
+	int blockSize = BLOCK_SIZE;
+	int gridSize = numSMs * 32;
+
+	printf("====================================================\n");
+	printf(" Execution Grid Topology: %d blocks x %d threads\n", gridSize, blockSize);
+	printf(" Campaign Scope Targets: Bases %u to %u\n", global_minbase.load(), max_target_base);
+	printf("====================================================\n");
+
+	if (global_minbase.load() <= 2 && 2 <= max_target_base)
+	{
+		logRecord(1, 3);
+		global_minbase.store(3);
+	}
+	if (global_minbase.load() <= 3 && 3 <= max_target_base)
+	{
+		logRecord(2, 5);
+		global_minbase.store(4);
+	}
+	if (global_minbase.load() <= 4 && 4 <= max_target_base)
+	{
+		logRecord(3, 5);
+		global_minbase.store(5);
+	}
+	if (global_minbase.load() <= 5 && 5 <= max_target_base)
+	{
+		logRecord(4, 11);
+		global_minbase.store(6);
+	}
+	if (global_minbase.load() <= 6 && 6 <= max_target_base)
+	{
+		logRecord(5, 17);
+		global_minbase.store(7);
+	}
+	if (global_minbase.load() <= 7 && 7 <= max_target_base)
+	{
+		logRecord(6, 17);
+		global_minbase.store(8);
+	}
+	if (global_minbase.load() <= 8 && 8 <= max_target_base)
+	{
+		logRecord(7, 17);
+		global_minbase.store(9);
+	}
+	if (global_minbase.load() > max_target_base)
+		global_target_achieved.store(true);
+
+	std::thread worker(verificationWorker, max_target_base);
+
+	auto t_start = std::chrono::high_resolution_clock::now();
+
+	uint64_t current_block = start_block;
+	bool buffer_A_active = true;
+	bool stream_A_inflight = false, stream_B_inflight = false;
+	uint64_t start_range_A = 0, start_range_B = 0;
+	uint64_t dispatched_block_id_A = 0, dispatched_block_id_B = 0;
+	uint32_t dispatched_minbase_A = 0, dispatched_minbase_B = 0;
+
+	size_t shared_mem_bytes = sp_bytes + 6561 + 15625 + 1296 + 2401 + 6561 + 10000;
+
+	while (current_block < end_block && !global_target_achieved.load())
+	{
+		uint32_t active_minbase = global_minbase.load();
+
+		uint64_t dynamic_batch;
+		if (active_minbase <= 6)
+			dynamic_batch = 2;
+		else if (active_minbase <= 8)
+			dynamic_batch = 25;
+		else if (active_minbase <= 10)
+			dynamic_batch = 50;
+		else if (active_minbase <= 12)
+			dynamic_batch = 500;
+		else if (active_minbase <= 14)
+			dynamic_batch = 1000;
+		else
+			dynamic_batch = 2000;
+
+		uint64_t dispatch_blocks = std::min(dynamic_batch, end_block - current_block);
+
+		uint64_t raw_start_range = current_block * block_size;
+
+		//uint64_t range_start = (raw_start_range / 30ULL) * 30ULL;
+		uint64_t range_start = (raw_start_range / 210ULL) * 210ULL;
+
+		uint64_t total_numbers_in_launch = dispatch_blocks * block_size + (raw_start_range - range_start);
+
+		auto launch_search = [&](cudaStream_t stream, uint64_t start, uint64_t total, uint64_t *results, uint32_t *count, uint32_t mb)
+		{
+			if (mb >= 32)
+			{
+				unifiedSearchKernel<32><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+			}
+			else if (mb >= 16)
+			{
+				unifiedSearchKernel<16><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+			}
+			else
+			{
+				switch (mb)
+				{
+				case 9:
+					unifiedSearchKernel<9><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				case 10:
+					unifiedSearchKernel<10><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				case 11:
+					unifiedSearchKernel<11><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				case 12:
+					unifiedSearchKernel<12><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				case 13:
+					unifiedSearchKernel<13><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				case 14:
+					unifiedSearchKernel<14><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				case 15:
+					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				default:
+					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12);
+					break;
+				}
+			}
+		};
+
+		if (buffer_A_active)
+		{
+			if (stream_A_inflight)
+			{
+				CUDA_CHECK(cudaStreamSynchronize(stream_A));
+
+				if (*h_count_A > 0)
+				{
+					uint32_t fetch_count = (*h_count_A > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_A;
+					BufferBundle bundle;
+					{
+						std::unique_lock<std::mutex> lock(pool_mutex);
+						pool_cv.wait(lock, []
+								 { return !free_buffers.empty(); });
+						bundle = free_buffers.front();
+						free_buffers.pop();
+					}
+
+					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_A, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
+					CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
+
+					{
+						std::lock_guard<std::mutex> lock(queue_mutex);
+						verification_queue.push({bundle, fetch_count, start_range_A, dispatched_block_id_A, dispatched_minbase_A});
+					}
+					queue_cv.notify_one();
+				}
+			}
+
+			CUDA_CHECK(cudaMemsetAsync(d_count_A, 0, sizeof(uint32_t), stream_A));
+			launch_search(stream_A, range_start, total_numbers_in_launch, d_results_A, d_count_A, active_minbase);
+			CUDA_CHECK(cudaMemcpyAsync(h_count_A, d_count_A, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_A));
+
+			start_range_A = raw_start_range;
+			dispatched_block_id_A = current_block + dispatch_blocks - 1;
+			dispatched_minbase_A = active_minbase;
+			stream_A_inflight = true;
+			buffer_A_active = false;
+		}
+		else
+		{
+			if (stream_B_inflight)
+			{
+				CUDA_CHECK(cudaStreamSynchronize(stream_B));
+
+				if (*h_count_B > 0)
+				{
+					uint32_t fetch_count = (*h_count_B > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_B;
+					BufferBundle bundle;
+					{
+						std::unique_lock<std::mutex> lock(pool_mutex);
+						pool_cv.wait(lock, []
+								 { return !free_buffers.empty(); });
+						bundle = free_buffers.front();
+						free_buffers.pop();
+					}
+
+					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_B, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
+					CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
+					{
+						std::lock_guard<std::mutex> lock(queue_mutex);
+						verification_queue.push({bundle, fetch_count, start_range_B, dispatched_block_id_B, dispatched_minbase_B});
+					}
+					queue_cv.notify_one();
+				}
+			}
+
+			CUDA_CHECK(cudaMemsetAsync(d_count_B, 0, sizeof(uint32_t), stream_B));
+			launch_search(stream_B, range_start, total_numbers_in_launch, d_results_B, d_count_B, active_minbase);
+			CUDA_CHECK(cudaMemcpyAsync(h_count_B, d_count_B, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_B));
+
+			start_range_B = raw_start_range;
+			dispatched_block_id_B = current_block + dispatch_blocks - 1;
+			dispatched_minbase_B = active_minbase;
+			stream_B_inflight = true;
+			buffer_A_active = true;
+		}
+		current_block += dispatch_blocks;
+	}
+
+	// --- CHRONOLOGICAL TEARDOWN ---
+	auto push_A = [&]()
+	{
+		if (stream_A_inflight)
+		{
+			CUDA_CHECK(cudaStreamSynchronize(stream_A));
+			if (*h_count_A > 0)
+			{
+				uint32_t fetch_count = (*h_count_A > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_A;
+				BufferBundle bundle;
+
+				{
+					std::unique_lock<std::mutex> lock(pool_mutex);
+					pool_cv.wait(lock, []
+							 { return !free_buffers.empty(); });
+					bundle = free_buffers.front();
+					free_buffers.pop();
+				}
+
+				CUDA_CHECK(cudaMemcpy(bundle.memory, d_results_A, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+				CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
+				{
+					std::lock_guard<std::mutex> lock(queue_mutex);
+					verification_queue.push({bundle, fetch_count, start_range_A, dispatched_block_id_A, dispatched_minbase_A});
+				}
+				queue_cv.notify_one();
+			}
+		}
+	};
+
+	auto push_B = [&]()
+	{
+		if (stream_B_inflight)
+		{
+			CUDA_CHECK(cudaStreamSynchronize(stream_B));
+			if (*h_count_B > 0)
+			{
+				uint32_t fetch_count = (*h_count_B > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_B;
+				BufferBundle bundle;
+				{
+					std::unique_lock<std::mutex> lock(pool_mutex);
+					pool_cv.wait(lock, []
+							 { return !free_buffers.empty(); });
+					bundle = free_buffers.front();
+					free_buffers.pop();
+				}
+				CUDA_CHECK(cudaMemcpy(bundle.memory, d_results_B, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+				CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
+				{
+					std::lock_guard<std::mutex> lock(queue_mutex);
+					verification_queue.push({bundle, fetch_count, start_range_B, dispatched_block_id_B, dispatched_minbase_B});
+				}
+				queue_cv.notify_one();
+			}
+		}
+	};
+
+	if (!buffer_A_active)
+	{
+		push_B();
+		push_A();
+	}
+	else
+	{
+		push_A();
+		push_B();
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(queue_mutex);
+		engine_running = false;
+	}
+	queue_cv.notify_one();
+	worker.join();
+
+	auto t_end = std::chrono::high_resolution_clock::now();
+	std::chrono::duration<double> diff = t_end - t_start;
+	double total_time = diff.count();
+	uint64_t total_numbers_checked = (current_block - start_block) * block_size;
+
+	printf("\n==================================================\n");
+	printf(" Execution Terminated Successfully.\n");
+	printf(" Elapsed Time: %.2f seconds\n", total_time);
+	printf(" Effective Hardware Throughput: %.2f Billion numbers/sec\n", (total_numbers_checked / total_time) / 1e9);
+	printf("==================================================\n");
+
+	CUDA_CHECK(cudaStreamDestroy(stream_A));
+	CUDA_CHECK(cudaStreamDestroy(stream_B));
+	CUDA_CHECK(cudaStreamDestroy(stream_transfer));
+
+	CUDA_CHECK(cudaFree(d_sp));
+	CUDA_CHECK(cudaFree(d_b3));
+	CUDA_CHECK(cudaFree(d_b5));
+	CUDA_CHECK(cudaFree(d_b6));
+	CUDA_CHECK(cudaFree(d_b7));
+	CUDA_CHECK(cudaFree(d_b9));
+	CUDA_CHECK(cudaFree(d_b10));
+	CUDA_CHECK(cudaFree(d_b11));
+	CUDA_CHECK(cudaFree(d_b12));
+	CUDA_CHECK(cudaFree(d_results_A));
+	CUDA_CHECK(cudaFree(d_results_B));
+	CUDA_CHECK(cudaFree(d_count_A));
+	CUDA_CHECK(cudaFree(d_count_B));
+	CUDA_CHECK(cudaFreeHost(h_count_A));
+	CUDA_CHECK(cudaFreeHost(h_count_B));
+
+	for (int i = 0; i < POOL_SIZE; i++)
+	{
+		CUDA_CHECK(cudaFreeHost(h_buffer_pool[i]));
+	}
+	free(global_smallprimes);
+
+	return 0;
+}
