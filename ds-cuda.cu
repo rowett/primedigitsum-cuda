@@ -67,6 +67,7 @@ std::string formatCommas(uint64_t num)
 }
 
 // Block size on the GPU
+// Do not change since this is required for the mod-210 wheel to work!
 #define BLOCK_SIZE 768
 
 // Maximum number of candidates returned by the GPU
@@ -452,7 +453,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			uint32_t p = __popcll(candidate);
 			// hack: shift by 64 means shift by 0 and the 0th bit of PRIME_MASK_64 is 0.
 			// therefore the bitwise check evaluates to false and correctly rejects the number.
-			// if (p >= 64 || !((PRIME_MASK_64 >> p) & 1ULL)) break;
 			if (!((PRIME_MASK_64 >> p) & 1ULL))
 				break;
 
