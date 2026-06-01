@@ -22,9 +22,9 @@
 // the other is processing the next block of candidates in
 // parallel.
 //
-// An RTX4070 GPU processes around 770 billion candidates per
+// An RTX4070 GPU processes around 810 billion candidates per
 // second. The GPU is given a block of 2 trillion numbers to
-// check which is does in about 2.6 seconds.
+// check which is does in about 2.5 seconds.
 //
 // The filtering on the GPU typically results in about 1 in 2 million
 // surviving candidates being returned which for the block size
@@ -489,12 +489,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		{	
 			// Base 2
 			uint32_t p = __popcll(candidate);
-			if (!s_sp[p])
-				break;
 
 			// Base 4
 			uint32_t ds4 = p + __popcll(candidate & 0xAAAAAAAAAAAAAAAAULL);
-			if (!s_sp[ds4])
+
+			// check base 2 and base 4 simultaneously since chance of all threads in a warp
+			// failing at base 2 is tiny
+			if (!(s_sp[p] & s_sp[ds4]))
 				break;
 
 			// Base 16
