@@ -5,7 +5,7 @@
 //
 // The GPU is used identify candidate numbers by:
 // 1. Using a mod-30 prime wheel to reject any number that is a
-//    multiple of 2, 3 or 5 (this rejects 73.33% of candidates)
+//    multiple of 2, 3, 5 or 7 (this rejects 77.1% of candidates)
 // 2. Checking if the digit sums are prime in the following
 //    bases in this order: (powers of two) 2, 4, 16, 8, 32,
 //                         (even bases)    12, 6, 10,
@@ -84,6 +84,41 @@ std::string formatCommas(uint64_t num)
 			exit(EXIT_FAILURE);                                              \
 		}                                                                      \
 	} while (0)
+
+// constants for digit sum chunking
+// base 3 widened
+const uint32_t base3Size = 3 * 3 * 3 * 3 * 3 * 3 * 3 * 3;
+
+// base 5 widened
+const uint32_t base5Size = 5 * 5 * 5 * 5 * 5 * 5;
+
+// base 6
+const uint32_t base6Size = 6 * 6 * 6 * 6;
+
+// base 7
+const uint32_t base7Size = 7 * 7 * 7 * 7;
+
+// base 9
+const uint32_t base9Size = 9 * 9 * 9 * 9;
+
+// base 10
+const uint32_t base10Size = 10 * 10 * 10 * 10;
+
+// base 11
+const uint32_t base11Size = 11 * 11 * 11 * 11;
+
+// base 12
+const uint32_t base12Size = 12 * 12 * 12 * 12;
+
+// bases 16 byte aligned
+const uint32_t base3Size16 = (base3Size + 15) & ~15;
+const uint32_t base5Size16 = (base5Size + 15) & ~15;
+const uint32_t base6Size16 = (base6Size + 15) & ~15;
+const uint32_t base7Size16 = (base7Size + 15) & ~15;
+const uint32_t base9Size16 = (base9Size + 15) & ~15;
+const uint32_t base10Size16 = (base10Size + 15) & ~15;
+const uint32_t base11Size16 = (base11Size + 15) & ~15;
+const uint32_t base12Size16 = (base12Size + 15) & ~15;
 
 // --- Host Verification ---
 static uint64_t mulmod(uint64_t a, uint64_t b, uint64_t n)
@@ -394,36 +429,54 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
     const uint8_t *__restrict__ b9, const uint8_t *__restrict__ b10,
     const uint8_t *__restrict__ b11, const uint8_t *__restrict__ b12)
 {
-
-	//uint64_t global_tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-	//uint64_t total_threads = (uint64_t)gridDim.x * blockDim.x;
 	uint32_t lane_id = threadIdx.x & 31;
 
 	// --- SHARED MEMORY ALLOCATION BLOCK ---
 	extern __shared__ uint8_t s_mem[];
 	uint8_t *s_sp = s_mem;
-	uint8_t *s_b3 = s_sp + sp_size;
-	uint8_t *s_b5 = s_b3 + 6561;
-	uint8_t *s_b6 = s_b5 + 15625;
-	uint8_t *s_b7 = s_b6 + 1296;
-	uint8_t *s_b9 = s_b7 + 2401;
-	uint8_t *s_b10 = s_b9 + 6561;
+
+	uint8_t *s_b12 = s_sp + sp_size;
+	uint8_t *s_b6 = s_b12 + base12Size16;
+	uint8_t *s_b10 = s_b6 + base6Size16;
+	uint8_t *s_b9 = s_b10 + base10Size16;
+	uint8_t *s_b3 = s_b9 + base9Size16;
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
-	for (uint32_t i = threadIdx.x; i < sp_size; i += blockDim.x)
-		s_sp[i] = g_sp[i];
-	for (uint32_t i = threadIdx.x; i < 6561; i += blockDim.x)
-		s_b3[i] = b3[i];
-	for (uint32_t i = threadIdx.x; i < 15625; i += blockDim.x)
-		s_b5[i] = b5[i];
-	for (uint32_t i = threadIdx.x; i < 1296; i += blockDim.x)
-		s_b6[i] = b6[i];
-	for (uint32_t i = threadIdx.x; i < 2401; i += blockDim.x)
-		s_b7[i] = b7[i];
-	for (uint32_t i = threadIdx.x; i < 6561; i += blockDim.x)
-		s_b9[i] = b9[i];
-	for (uint32_t i = threadIdx.x; i < 10000; i += blockDim.x)
-		s_b10[i] = b10[i];
+	uint32_t *shared = (uint32_t*)s_sp;
+	uint32_t *global = (uint32_t*)g_sp;
+	uint32_t words = sp_size >> 2;
+	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+		shared[i] = global[i];
+
+	shared = (uint32_t*)s_b3;
+	global = (uint32_t*)b3;
+	words = base3Size16 >> 2;
+	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+		shared[i] = global[i];
+
+	shared = (uint32_t*)s_b6;
+	global = (uint32_t*)b6;
+	words = base6Size16 >> 2;
+	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+		shared[i] = global[i];
+
+	shared = (uint32_t*)s_b9;
+	global = (uint32_t*)b9;
+	words = base9Size16 >> 2;
+	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+		shared[i] = global[i];
+
+	shared = (uint32_t*)s_b10;
+	global = (uint32_t*)b10;
+	words = base10Size16 >> 2;
+	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+		shared[i] = global[i];
+
+	shared = (uint32_t*)s_b12;
+	global = (uint32_t*)b12;
+	words = base12Size16 >> 2;
+	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+		shared[i] = global[i];
 
 	__syncthreads();
 
@@ -496,7 +549,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			uint64_t v_hi;
 			uint32_t v_low;
 
-			// --- Base 12 (left in Global memory) ---
+			// --- Base 12 ---
 			if constexpr (MIN_BASE >= 12)
 			{
 				v_hi = candidate / 429981696ULL;
@@ -504,18 +557,18 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				sum = 0;
 				r64 = v_hi;
 				rq64 = r64 / 20736ULL;
-				sum += b12[r64 - rq64 * 20736ULL];
+				sum += s_b12[r64 - rq64 * 20736ULL];
 				r64 = rq64;
 				r = (uint32_t)r64;
 				rq = r / 20736U;
-				sum += b12[r - rq * 20736U];
+				sum += s_b12[r - rq * 20736U];
 				r = rq;
-				sum += b12[r];
+				sum += s_b12[r];
 				r = v_low;
 				rq = r / 20736U;
-				sum += b12[r - rq * 20736U];
+				sum += s_b12[r - rq * 20736U];
 				r = rq;
-				sum += b12[r];
+				sum += s_b12[r];
 				if (!s_sp[sum])
 					break;
 			}
@@ -585,20 +638,21 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 			r64 = v_hi;
 			rq64 = r64 / 15625ULL;
-			sum += s_b5[r64 - rq64 * 15625ULL];
+			//sum += s_b5[r64 - rq64 * 15625ULL];
+			sum += b5[r64 - rq64 * 15625ULL];
 			r64 = rq64;
 
 			r = (uint32_t)r64;
 			rq = r / 15625U;
-			sum += s_b5[r - rq * 15625U];
+			sum += b5[r - rq * 15625U];
 			r = rq;
-			sum += s_b5[r];
+			sum += b5[r];
 
 			r = v_low;
 			rq = r / 15625U;
-			sum += s_b5[r - rq * 15625U];
+			sum += b5[r - rq * 15625U];
 			r = rq;
-			sum += s_b5[r];
+			sum += b5[r];
 			if (!s_sp[sum])
 				break;
 
@@ -655,7 +709,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			if (!s_sp[sum])
 				break;
 
-			// --- Base 11 (left in Global Memory) ---
+			// --- Base 11 ---
 			if constexpr (MIN_BASE >= 11)
 			{
 				v_hi = candidate / 2357947691ULL;
@@ -663,21 +717,21 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				sum = 0;
 				r64 = v_hi;
 				rq64 = r64 / 14641ULL;
-				sum += b11[r64 - rq64 * 14641ULL];
+				sum += __ldg(&b11[r64 - rq64 * 14641ULL]);
 				r64 = rq64;
 				r = (uint32_t)r64;
 				rq = r / 14641U;
-				sum += b11[r - rq * 14641U];
+				sum += __ldg(&b11[r - rq * 14641U]);
 				r = rq;
-				sum += b11[r];
+				sum += __ldg(&b11[r]);
 				r = v_low;
 				rq = r / 14641U;
-				sum += b11[r - rq * 14641U];
+				sum += __ldg(&b11[r - rq * 14641U]);
 				r = rq;
 				rq = r / 14641U;
-				sum += b11[r - rq * 14641U];
+				sum += __ldg(&b11[r - rq * 14641U]);
 				r = rq;
-				sum += b11[r];
+				sum += __ldg(&b11[r]);
 				if (!s_sp[sum])
 					break;
 			}
@@ -689,22 +743,22 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 			r64 = v_hi;
 			rq64 = r64 / 2401ULL;
-			sum += s_b7[r64 - rq64 * 2401ULL];
+			sum += b7[r64 - rq64 * 2401ULL];
 			r64 = rq64;
 			r = (uint32_t)r64;
 			rq = r / 2401U;
-			sum += s_b7[r - rq * 2401U];
+			sum += b7[r - rq * 2401U];
 			r = rq;
-			sum += s_b7[r];
+			sum += b7[r];
 
 			r = v_low;
 			rq = r / 2401U;
-			sum += s_b7[r - rq * 2401U];
+			sum += b7[r - rq * 2401U];
 			r = rq;
 			rq = r / 2401U;
-			sum += s_b7[r - rq * 2401U];
+			sum += b7[r - rq * 2401U];
 			r = rq;
-			sum += s_b7[r];
+			sum += b7[r];
 			if (!s_sp[sum])
 				break;
 
@@ -954,59 +1008,67 @@ int main(int argc, char **argv)
 	uint32_t sp_bytes = largestds + 1;
 	if (sp_bytes < 155)
 		sp_bytes = 155;
-	sp_bytes = (sp_bytes + 3) & ~3;
+
+	// 16 byte align
+	sp_bytes = (sp_bytes + 15) & ~15;
 
 	global_smallprimes = (uint8_t *)calloc(sp_bytes, sizeof(uint8_t));
 	for (uint32_t i = 0; i <= largestds; i++)
 		global_smallprimes[i] = cpu_isPrime(i) ? 1 : 0;
 
 	// The widened Base 3 and Base 5 CPU generation
-	uint8_t h_base3[6561];
-	for (int i = 0; i < 6561; i++)
+	uint8_t h_base3[base3Size];
+	for (int i = 0; i < base3Size; i++)
 		h_base3[i] = sumDigits(i, 3);
-	uint8_t h_base5[15625];
-	for (int i = 0; i < 15625; i++)
+
+	uint8_t h_base5[base5Size];
+	for (int i = 0; i < base5Size; i++)
 		h_base5[i] = sumDigits(i, 5);
 
-	uint8_t h_base6[1296];
-	for (int i = 0; i < 1296; i++)
+	uint8_t h_base6[base6Size];
+	for (int i = 0; i < base6Size; i++)
 		h_base6[i] = sumDigits(i, 6);
-	uint8_t h_base7[2401];
-	for (int i = 0; i < 2401; i++)
+
+	uint8_t h_base7[base7Size];
+	for (int i = 0; i < base7Size; i++)
 		h_base7[i] = sumDigits(i, 7);
-	uint8_t h_base9[6561];
-	for (int i = 0; i < 6561; i++)
+
+	uint8_t h_base9[base9Size];
+	for (int i = 0; i < base9Size; i++)
 		h_base9[i] = sumDigits(i, 9);
-	uint8_t h_base10[10000];
-	for (int i = 0; i < 10000; i++)
+
+	uint8_t h_base10[base10Size];
+	for (int i = 0; i < base10Size; i++)
 		h_base10[i] = sumDigits(i, 10);
-	uint8_t h_base11[14641];
-	for (int i = 0; i < 14641; i++)
+
+	uint8_t h_base11[base11Size];
+	for (int i = 0; i < base11Size; i++)
 		h_base11[i] = sumDigits(i, 11);
-	uint8_t h_base12[20736];
-	for (int i = 0; i < 20736; i++)
+
+	uint8_t h_base12[base12Size];
+	for (int i = 0; i < base12Size; i++)
 		h_base12[i] = sumDigits(i, 12);
 
 	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12;
 	CUDA_CHECK(cudaMalloc((void **)&d_sp, sp_bytes));
-	CUDA_CHECK(cudaMalloc((void **)&d_b3, 6561));  // Expanded allocation
-	CUDA_CHECK(cudaMalloc((void **)&d_b5, 15625)); // Expanded allocation
-	CUDA_CHECK(cudaMalloc((void **)&d_b6, 1296));
-	CUDA_CHECK(cudaMalloc((void **)&d_b7, 2401));
-	CUDA_CHECK(cudaMalloc((void **)&d_b9, 6561));
-	CUDA_CHECK(cudaMalloc((void **)&d_b10, 10000));
-	CUDA_CHECK(cudaMalloc((void **)&d_b11, 14641));
-	CUDA_CHECK(cudaMalloc((void **)&d_b12, 20736));
+	CUDA_CHECK(cudaMalloc((void **)&d_b3, base3Size16));  // Expanded allocation
+	CUDA_CHECK(cudaMalloc((void **)&d_b5, base5Size16)); // Expanded allocation
+	CUDA_CHECK(cudaMalloc((void **)&d_b6, base6Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b7, base7Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b9, base9Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b10, base10Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b11, base11Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b12, base12Size16));
 
 	CUDA_CHECK(cudaMemcpy(d_sp, global_smallprimes, sp_bytes, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b3, h_base3, 6561, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b5, h_base5, 15625, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b6, h_base6, 1296, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b7, h_base7, 2401, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b9, h_base9, 6561, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b10, h_base10, 10000, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b11, h_base11, 14641, cudaMemcpyHostToDevice));
-	CUDA_CHECK(cudaMemcpy(d_b12, h_base12, 20736, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b3, h_base3, base3Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b5, h_base5, base5Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b6, h_base6, base6Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b7, h_base7, base7Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b9, h_base9, base9Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b10, h_base10, base10Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b11, h_base11, base11Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b12, h_base12, base12Size, cudaMemcpyHostToDevice));
 
 	uint64_t *d_results_A, *d_results_B;
 	uint32_t *d_count_A, *d_count_B;
@@ -1094,7 +1156,8 @@ int main(int argc, char **argv)
 	uint64_t dispatched_block_id_A = 0, dispatched_block_id_B = 0;
 	uint32_t dispatched_minbase_A = 0, dispatched_minbase_B = 0;
 
-	size_t shared_mem_bytes = sp_bytes + 6561 + 15625 + 1296 + 2401 + 6561 + 10000;
+	// bases 12, 6, 10, 9 and 3 fit in shared memory
+	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16 + base9Size16 + base3Size16;
 
 	while (current_block < end_block && !global_target_achieved.load())
 	{
