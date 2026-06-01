@@ -438,43 +438,29 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	uint8_t *s_b12 = s_sp + sp_size;
 	uint8_t *s_b6 = s_b12 + base12Size16;
 	uint8_t *s_b10 = s_b6 + base6Size16;
-	uint8_t *s_b9 = s_b10 + base10Size16;
-	uint8_t *s_b3 = s_b9 + base9Size16;
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
-	uint32_t *shared = (uint32_t*)s_sp;
-	uint32_t *global = (uint32_t*)g_sp;
-	uint32_t words = sp_size >> 2;
+	uint4 *shared = (uint4*)s_sp;
+	uint4 *global = (uint4*)g_sp;
+	uint32_t words = sp_size >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 		shared[i] = global[i];
 
-	shared = (uint32_t*)s_b3;
-	global = (uint32_t*)b3;
-	words = base3Size16 >> 2;
+	shared = (uint4*)s_b6;
+	global = (uint4*)b6;
+	words = base6Size16 >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 		shared[i] = global[i];
 
-	shared = (uint32_t*)s_b6;
-	global = (uint32_t*)b6;
-	words = base6Size16 >> 2;
+	shared = (uint4*)s_b10;
+	global = (uint4*)b10;
+	words = base10Size16 >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 		shared[i] = global[i];
 
-	shared = (uint32_t*)s_b9;
-	global = (uint32_t*)b9;
-	words = base9Size16 >> 2;
-	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		shared[i] = global[i];
-
-	shared = (uint32_t*)s_b10;
-	global = (uint32_t*)b10;
-	words = base10Size16 >> 2;
-	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		shared[i] = global[i];
-
-	shared = (uint32_t*)s_b12;
-	global = (uint32_t*)b12;
-	words = base12Size16 >> 2;
+	shared = (uint4*)s_b12;
+	global = (uint4*)b12;
+	words = base12Size16 >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 		shared[i] = global[i];
 
@@ -638,7 +624,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 			r64 = v_hi;
 			rq64 = r64 / 15625ULL;
-			//sum += s_b5[r64 - rq64 * 15625ULL];
 			sum += b5[r64 - rq64 * 15625ULL];
 			r64 = rq64;
 
@@ -663,22 +648,22 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 			r64 = v_hi;
 			rq64 = r64 / 6561ULL;
-			sum += s_b9[r64 - rq64 * 6561ULL];
+			sum += b9[r64 - rq64 * 6561ULL];
 			r64 = rq64;
 			r = (uint32_t)r64;
 			rq = r / 6561U;
-			sum += s_b9[r - rq * 6561U];
+			sum += b9[r - rq * 6561U];
 			r = rq;
-			sum += s_b9[r];
+			sum += b9[r];
 
 			r = v_low;
 			rq = r / 6561U;
-			sum += s_b9[r - rq * 6561U];
+			sum += b9[r - rq * 6561U];
 			r = rq;
 			rq = r / 6561U;
-			sum += s_b9[r - rq * 6561U];
+			sum += b9[r - rq * 6561U];
 			r = rq;
-			sum += s_b9[r];
+			sum += b9[r];
 			if (!s_sp[sum])
 				break;
 
@@ -689,23 +674,23 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 			r64 = v_hi;
 			rq64 = r64 / 6561ULL;
-			sum += s_b3[r64 - rq64 * 6561ULL];
+			sum += b3[r64 - rq64 * 6561ULL];
 			r64 = rq64;
 
 			r = (uint32_t)r64;
 			rq = r / 6561U;
-			sum += s_b3[r - rq * 6561U];
+			sum += b3[r - rq * 6561U];
 			r = rq;
 			rq = r / 6561U;
-			sum += s_b3[r - rq * 6561U];
+			sum += b3[r - rq * 6561U];
 			r = rq;
-			sum += s_b3[r];
+			sum += b3[r];
 
 			r = v_low;
 			rq = r / 6561U;
-			sum += s_b3[r - rq * 6561U];
+			sum += b3[r - rq * 6561U];
 			r = rq;
-			sum += s_b3[r];
+			sum += b3[r];
 			if (!s_sp[sum])
 				break;
 
@@ -1156,8 +1141,8 @@ int main(int argc, char **argv)
 	uint64_t dispatched_block_id_A = 0, dispatched_block_id_B = 0;
 	uint32_t dispatched_minbase_A = 0, dispatched_minbase_B = 0;
 
-	// bases 12, 6, 10, 9 and 3 fit in shared memory
-	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16 + base9Size16 + base3Size16;
+	// bases 12, 6 and 10 fit in shared memory
+	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
 
 	while (current_block < end_block && !global_target_achieved.load())
 	{
@@ -1181,7 +1166,6 @@ int main(int argc, char **argv)
 
 		uint64_t raw_start_range = current_block * block_size;
 
-		//uint64_t range_start = (raw_start_range / 30ULL) * 30ULL;
 		uint64_t range_start = (raw_start_range / 210ULL) * 210ULL;
 
 		uint64_t total_numbers_in_launch = dispatch_blocks * block_size + (raw_start_range - range_start);
