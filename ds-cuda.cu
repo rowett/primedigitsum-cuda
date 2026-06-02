@@ -412,9 +412,9 @@ void saveHeartbeatState(uint64_t completed_block, uint32_t current_base)
 
 // 48 offsets coprime to 2, 3, 5, and 7
 __device__ const uint8_t d_wheel_210[48] = {
-    1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 
-    71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 121, 127, 131, 
-    137, 139, 143, 149, 151, 157, 163, 167, 169, 173, 179, 181, 187, 
+    1, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67,
+    71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 121, 127, 131,
+    137, 139, 143, 149, 151, 157, 163, 167, 169, 173, 179, 181, 187,
     191, 193, 197, 199, 209
 };
 
@@ -471,13 +471,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	// Calculated exactly ONCE per thread
 	uint32_t wheel_idx = threadIdx.x % 48;       // Fast 32-bit math
 	uint32_t cycle_in_block = threadIdx.x / 48;
-    
+
 	// Each block processes 16 full wheels (16 * 210 = 3360 numbers span)
 	uint64_t cycle = (uint64_t)blockIdx.x * 16ULL + cycle_in_block;
-    
+
 	// Start range logic
 	uint64_t candidate = start_range + (cycle * 210ULL) + __ldg(&d_wheel_210[wheel_idx]);
-    
+
 	// The stride is simply the total grid span
 	uint64_t stride = (uint64_t)gridDim.x * 16ULL * 210ULL;
 
@@ -486,7 +486,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		bool pass = false;
 
 		do
-		{	
+		{
 			// Base 2
 			uint32_t p = __popcll(candidate);
 
@@ -823,7 +823,7 @@ void verificationWorker(uint32_t max_target_base)
 					if (b == 2 || b == 4 || b == 8 || b == 16 || b == 32)
 						checked_by_gpu = true;
 
-					// Modulo Bases handled by GPU (Notice 7 and 11 are missing)
+					// Modulo Bases handled by GPU
 					if (b == 3 || b == 5 || b == 6 || b == 7 || b == 9 || b == 10 || b == 11 || b == 12)
 						checked_by_gpu = true;
 				}
@@ -1077,7 +1077,7 @@ int main(int argc, char **argv)
 		CUDA_CHECK(cudaHostAlloc((void **)&h_buffer_pool[i], MAX_GPU_RESULTS * sizeof(uint64_t), cudaHostAllocDefault));
 
 		cudaEvent_t event;
-		CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
+		CUDA_CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming | cudaEventBlockingSync));
 		free_buffers.push({h_buffer_pool[i], event});
 	}
 
