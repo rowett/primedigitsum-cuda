@@ -754,12 +754,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		{
 			uint32_t warp_count = __popc(warp_mask);
 			uint32_t base_idx = 0;
+			uint32_t elect_lane = __ffs(warp_mask) - 1; // lowest set bit = first active lane
 
-			if (lane_id == 0)
+			if (lane_id == elect_lane)
 			{
 				base_idx = atomicAdd(d_count, warp_count);
 			}
-			base_idx = __shfl_sync(0xFFFFFFFF, base_idx, 0);
+			base_idx = __shfl_sync(0xFFFFFFFF, base_idx, elect_lane);
 
 			uint32_t local_offset = __popc(warp_mask & ((1u << lane_id) - 1));
 			if (pass && base_idx + local_offset < MAX_GPU_RESULTS)
@@ -1034,7 +1035,7 @@ int main(int argc, char **argv)
 
 	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12;
 	CUDA_CHECK(cudaMalloc((void **)&d_sp, sp_bytes));
-	CUDA_CHECK(cudaMalloc((void **)&d_b3, base3Size16));  // Expanded allocation
+	CUDA_CHECK(cudaMalloc((void **)&d_b3, base3Size16)); // Expanded allocation
 	CUDA_CHECK(cudaMalloc((void **)&d_b5, base5Size16)); // Expanded allocation
 	CUDA_CHECK(cudaMalloc((void **)&d_b6, base6Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b7, base7Size16));
