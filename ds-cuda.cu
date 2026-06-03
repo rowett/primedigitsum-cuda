@@ -52,6 +52,7 @@
 #include <time.h>
 #include <string>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 
 // Helper function to format large integers with commas
 std::string formatCommas(uint64_t num)
@@ -441,28 +442,35 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
 	uint4 *shared = (uint4*)s_sp;
-	uint4 *global = (uint4*)g_sp;
+	const uint4 *global = (const uint4*)g_sp;
 	uint32_t words = sp_size >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		shared[i] = global[i];
+		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+		//shared[i] = global[i];
 
 	shared = (uint4*)s_b6;
-	global = (uint4*)b6;
+	global = (const uint4*)b6;
 	words = base6Size16 >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		shared[i] = global[i];
+		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+		//shared[i] = global[i];
 
 	shared = (uint4*)s_b10;
-	global = (uint4*)b10;
+	global = (const uint4*)b10;
 	words = base10Size16 >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		shared[i] = global[i];
+		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+		//shared[i] = global[i];
 
 	shared = (uint4*)s_b12;
-	global = (uint4*)b12;
+	global = (const uint4*)b12;
 	words = base12Size16 >> 4;
 	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		shared[i] = global[i];
+		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+		//shared[i] = global[i];
+
+	__pipeline_commit();
+	__pipeline_wait_prior(0);
 
 	__syncthreads();
 
