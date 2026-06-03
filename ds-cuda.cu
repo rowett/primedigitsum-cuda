@@ -4,7 +4,7 @@
 // This program searches for ds(n) numbers.
 //
 // The GPU is used identify candidate numbers by:
-// 1. Using a mod-30 prime wheel to reject any number that is a
+// 1. Using a mod-210 prime wheel to reject any number that is a
 //    multiple of 2, 3, 5 or 7 (this rejects 77.1% of candidates)
 // 2. Checking if the digit sums are prime in the following
 //    bases in this order: (powers of two) 2, 4, 16, 8, 32,
@@ -474,6 +474,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 	__syncthreads();
 
+	const uint8_t* __restrict__ local_b12 = s_b12;
+	const uint8_t* __restrict__ local_b6  = s_b6;
+	const uint8_t* __restrict__ local_b10 = s_b10;
+
 	uint64_t end_range = start_range + total_numbers;
 
 	// Calculated exactly ONCE per thread
@@ -549,18 +553,18 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				sum = 0;
 				r64 = v_hi;
 				rq64 = r64 / 20736ULL;
-				sum += s_b12[r64 - rq64 * 20736ULL];
+				sum += local_b12[r64 - rq64 * 20736ULL];
 				r64 = rq64;
 				r = (uint32_t)r64;
 				rq = r / 20736U;
-				sum += s_b12[r - rq * 20736U];
+				sum += local_b12[r - rq * 20736U];
 				r = rq;
-				sum += s_b12[r];
+				sum += local_b12[r];
 				r = v_low;
 				rq = r / 20736U;
-				sum += s_b12[r - rq * 20736U];
+				sum += local_b12[r - rq * 20736U];
 				r = rq;
-				sum += s_b12[r];
+				sum += local_b12[r];
 				if (!s_sp[sum])
 					break;
 			}
@@ -572,25 +576,25 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 			r64 = v_hi;
 			rq64 = r64 / 1296ULL;
-			sum += s_b6[r64 - rq64 * 1296ULL];
+			sum += local_b6[r64 - rq64 * 1296ULL];
 			r64 = rq64;
 			r = (uint32_t)r64;
 			rq = r / 1296U;
-			sum += s_b6[r - rq * 1296U];
+			sum += local_b6[r - rq * 1296U];
 			r = rq;
 			rq = r / 1296U;
-			sum += s_b6[r - rq * 1296U];
+			sum += local_b6[r - rq * 1296U];
 			r = rq;
-			sum += s_b6[r];
+			sum += local_b6[r];
 
 			r = v_low;
 			rq = r / 1296U;
-			sum += s_b6[r - rq * 1296U];
+			sum += local_b6[r - rq * 1296U];
 			r = rq;
 			rq = r / 1296U;
-			sum += s_b6[r - rq * 1296U];
+			sum += local_b6[r - rq * 1296U];
 			r = rq;
-			sum += s_b6[r];
+			sum += local_b6[r];
 			if (!s_sp[sum])
 				break;
 
@@ -603,22 +607,22 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 				r64 = v_hi;
 				rq64 = r64 / 10000ULL;
-				sum += s_b10[r64 - rq64 * 10000ULL];
+				sum += local_b10[r64 - rq64 * 10000ULL];
 				r64 = rq64;
 				r = (uint32_t)r64;
 				rq = r / 10000U;
-				sum += s_b10[r - rq * 10000U];
+				sum += local_b10[r - rq * 10000U];
 				r = rq;
-				sum += s_b10[r];
+				sum += local_b10[r];
 
 				r = v_low;
 				rq = r / 10000U;
-				sum += s_b10[r - rq * 10000U];
+				sum += local_b10[r - rq * 10000U];
 				r = rq;
 				rq = r / 10000U;
-				sum += s_b10[r - rq * 10000U];
+				sum += local_b10[r - rq * 10000U];
 				r = rq;
-				sum += s_b10[r];
+				sum += local_b10[r];
 				if (!s_sp[sum])
 					break;
 			}
