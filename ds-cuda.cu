@@ -377,28 +377,29 @@ void logRecord(uint32_t base, uint64_t candidate)
 	}
 }
 
-void saveHeartbeatState(uint64_t completed_block, uint32_t current_base)
+void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t subblock_size, uint32_t current_base, uint32_t max_base)
 {
-	std::lock_guard<std::mutex> lock(file_mutex);
+      std::lock_guard<std::mutex> lock(file_mutex);
 
-	// Open in overwrite mode ("w") so it only stores the latest state
-	FILE *f = fopen("ds_state.txt", "w");
-	if (f != NULL)
-	{
-		time_t rawtime;
-		struct tm *timeinfo;
-		char buffer[80];
-		time(&rawtime);
-		timeinfo = localtime(&rawtime);
-		strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+      // Open in overwrite mode ("w") so it only stores the latest state
+      FILE *f = fopen("ds_state.txt", "w");
+      if (f != NULL)
+      {
+            time_t rawtime;
+            struct tm *timeinfo;
+            char buffer[80];
+            time(&rawtime);
+            timeinfo = localtime(&rawtime);
+            strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
 
-		fprintf(f, "--- ENGINE HEARTBEAT ---\n");
-		fprintf(f, "Last Saved: %s\n", buffer);
-		fprintf(f, "Restart Command Args:\n");
-		// Print the exact arguments you need to paste into the terminal to resume
-		fprintf(f, ".\\ds %" PRIu64 " <end_subblock> <subblock_size> %u <maxbase>\n", completed_block + 1, current_base);
-		fclose(f);
-	}
+            fprintf(f, "--- ENGINE HEARTBEAT ---\n");
+            fprintf(f, "Last Saved: %s\n", buffer);
+            fprintf(f, "Restart Command Args:\n");
+            // Print the exact arguments you need to paste into the terminal to resume
+            fprintf(f, ".\\ds %" PRIu64 " %" PRIu64 " %" PRIu64 " %u %u\n", 
+                    completed_block + 1, end_block, subblock_size, current_base, max_base);
+            fclose(f);
+      }
 }
 
 // ------------------------------------------------------------------------------------
@@ -829,7 +830,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 }
 
 // CPU verification worker that checks surviving candidates from the GPU filtering
-void verificationWorker(uint32_t max_target_base)
+void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max_target_base)
 {
 	auto last_heartbeat_time = std::chrono::steady_clock::now();
 	const std::chrono::seconds HEARTBEAT_INTERVAL(60); // Heartbeat interval is 60 seconds
@@ -1012,7 +1013,7 @@ void verificationWorker(uint32_t max_target_base)
 		auto current_time = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(current_time - last_heartbeat_time) >= HEARTBEAT_INTERVAL)
 		{
-			saveHeartbeatState(task.subblock_id, global_minbase.load());
+			saveHeartbeatState(task.subblock_id, end_block, subblock_size, global_minbase.load(), max_target_base);
 			last_heartbeat_time = current_time;
 		}
 
@@ -1171,10 +1172,16 @@ int main(int argc, char **argv)
 	// stride = exactly how many full wheels the grid processes per inner loop iteration
 	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / 5760ULL) * 30030ULL;
 
+	// get the GPU name
+	int deviceId;
+	CUDA_CHECK(cudaGetDevice(&deviceId));
+	cudaDeviceProp prop;
+	CUDA_CHECK(cudaGetDeviceProperties(&prop, deviceId));
+
 	printf("====================================================\n");
+	printf(" Active GPU: %s Compute %d.%d\n", prop.name, prop.major, prop.minor);
 	printf(" Execution Grid Topology: %d blocks x %d threads\n", gridSize, blockSize);
 	printf(" Campaign Scope Targets: Bases %u to %u\n", global_minbase.load(), max_target_base);
-	printf(" Engine Algorithm Update: Wheel 30030 Enabled\n");
 	printf("====================================================\n");
 
 	if (global_minbase.load() <= 2 && 2 <= max_target_base)
@@ -1215,7 +1222,7 @@ int main(int argc, char **argv)
 	if (global_minbase.load() > max_target_base)
 		global_target_achieved.store(true);
 
-	std::thread worker(verificationWorker, max_target_base);
+	std::thread worker(verificationWorker, end_block, subblock_size, max_target_base);
 
 	auto t_start = std::chrono::high_resolution_clock::now();
 
@@ -1458,11 +1465,11 @@ int main(int argc, char **argv)
 	double total_time = diff.count();
 	uint64_t total_numbers_checked = (current_block - start_block) * subblock_size;
 
-	printf("\n==================================================\n");
+	printf("\n===================================================\n");
 	printf(" Execution Terminated Successfully.\n");
 	printf(" Elapsed Time: %.2f seconds\n", total_time);
-	printf(" Effective Hardware Throughput: %.2f Billion numbers/sec\n", (total_numbers_checked / total_time) / 1e9);
-	printf("==================================================\n");
+	printf(" Effective Throughput: %.2f Billion numbers/sec\n", (total_numbers_checked / total_time) / 1e9);
+	printf("===================================================\n");
 
 	CUDA_CHECK(cudaStreamDestroy(stream_A));
 	CUDA_CHECK(cudaStreamDestroy(stream_B));

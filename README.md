@@ -2,7 +2,7 @@
 
 A high-performance CUDA program that searches for **ds(n)** numbers: the smallest prime whose digit sum in every base from 2 through n+1 is also prime.
 
-Achieves approximately **1,115 billion candidates per second** on an RTX 4070.
+Can search approximately **1.1 trillion numbers per second** on an RTX 4070.
 
 ---
 
@@ -184,19 +184,19 @@ ds.exe start_subblock end_subblock subblock_size minbase maxbase
 | `start_subblock` | First sub-block index to process (inclusive) |
 | `end_subblock` | Last sub-block index to process (exclusive) |
 | `subblock_size` | Number of integers per sub-block (typically 1000000000) |
-| `minbase` | Lowest ds(n) target to search for (resumes from here) |
-| `maxbase` | Highest ds(n) target; program exits when this is found |
+| `minbase` | Lowest ds(n) base to search for (resumes from here) |
+| `maxbase` | Highest ds(n) base; program exits when this is found |
 
-### Example — search from the beginning up to ds(20):
+### Example — search from the beginning up to ds(20) - note base is n + 1:
 
 ```
-ds.exe 0 1000000 10000000 2 20
+ds.exe 0 1000000 1000000000 2 21
 ```
 
 ### Example — resume from a heartbeat:
 
 ```
-ds.exe 12501 1000000 10000000 13 20
+ds.exe 12501 1000000 1000000000 13 21
 ```
 
 ---
