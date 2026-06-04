@@ -411,69 +411,78 @@ __constant__ uint32_t c_lane_mask[32];	 // Pre-calculated offset masks for warp 
 // This is the GPU kernel that filters candidate numbers
 template <uint32_t MIN_BASE>
 __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
-    uint64_t start_range, uint64_t total_numbers, uint64_t end_range,
-    const uint8_t *__restrict__ g_sp, uint32_t sp_size,
-    uint64_t *__restrict__ d_results, uint32_t *__restrict__ d_count,
-    const uint8_t *__restrict__ b3, const uint8_t *__restrict__ b5,
-    const uint8_t *__restrict__ b6, const uint8_t *__restrict__ b7,
-    const uint8_t *__restrict__ b9, const uint8_t *__restrict__ b10,
-    const uint8_t *__restrict__ b11, const uint8_t *__restrict__ b12,
-    const uint64_t stride)
+	const uint64_t start_range, const uint64_t total_numbers, const uint64_t end_range,
+	const uint8_t *__restrict__ g_sp, const uint32_t sp_size,
+	uint64_t *__restrict__ d_results, uint32_t *__restrict__ d_count,
+	const uint8_t *__restrict__ b3, const uint8_t *__restrict__ b5,
+	const uint8_t *__restrict__ b6, const uint8_t *__restrict__ b7,
+	const uint8_t *__restrict__ b9, const uint8_t *__restrict__ b10,
+	const uint8_t *__restrict__ b11, const uint8_t *__restrict__ b12,
+	const uint64_t stride)
 {
-	uint32_t lane_id = threadIdx.x & 31;
-
 	// --- SHARED MEMORY ALLOCATION BLOCK ---
 	extern __shared__ uint8_t s_mem[];
-	uint8_t *s_sp = s_mem;
 
-	uint8_t *s_b12 = s_sp + sp_size;
-	uint8_t *s_b6 = s_b12 + base12Size16;
-	uint8_t *s_b10 = s_b6 + base6Size16;
+	// Constant pointers to mutable shared memory during initialization
+	uint8_t * const s_sp  = s_mem;
+	uint8_t * const s_b12 = s_sp + sp_size;
+	uint8_t * const s_b6  = s_b12 + base12Size16;
+	uint8_t * const s_b10 = s_b6 + base6Size16;
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
-	uint4 *shared = (uint4 *)s_sp;
-	const uint4 *global = (const uint4 *)g_sp;
-	uint32_t words = sp_size >> 4;
-	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	// Scoped heavily to allow const parameters on iterators and pointers
+	{
+		uint4 * const shared = (uint4 *)s_sp;
+		const uint4 * const global = (const uint4 *)g_sp;
+		const uint32_t words = sp_size >> 4;
+		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+			__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	}
 
-	shared = (uint4 *)s_b6;
-	global = (const uint4 *)b6;
-	words = base6Size16 >> 4;
-	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	{
+		uint4 * const shared = (uint4 *)s_b6;
+		const uint4 * const global = (const uint4 *)b6;
+		const uint32_t words = base6Size16 >> 4;
+		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+			__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	}
 
-	shared = (uint4 *)s_b10;
-	global = (const uint4 *)b10;
-	words = base10Size16 >> 4;
-	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	{
+		uint4 * const shared = (uint4 *)s_b10;
+		const uint4 * const global = (const uint4 *)b10;
+		const uint32_t words = base10Size16 >> 4;
+		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+			__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	}
 
-	shared = (uint4 *)s_b12;
-	global = (const uint4 *)b12;
-	words = base12Size16 >> 4;
-	for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-		__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	{
+		uint4 * const shared = (uint4 *)s_b12;
+		const uint4 * const global = (const uint4 *)b12;
+		const uint32_t words = base12Size16 >> 4;
+		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+			__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	}
 
-	__pipeline_commit();
-	__pipeline_wait_prior(0);
-
-	__syncthreads();
-
-	const uint8_t *__restrict__ local_b12 = s_b12;
-	const uint8_t *__restrict__ local_b6 = s_b6;
-	const uint8_t *__restrict__ local_b10 = s_b10;
+	// Re-alias to strictly const data pointers for the compute phase
+	const uint8_t *__restrict__ const local_sp  = s_sp;
+	const uint8_t *__restrict__ const local_b12 = s_b12;
+	const uint8_t *__restrict__ const local_b6  = s_b6;
+	const uint8_t *__restrict__ const local_b10 = s_b10;
 
 	// Calculate global thread mapping for Wheel 30030
-	// We map 1 global thread strictly to 1 offset in the 5760-element wheel
-	uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+	const uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
 	// Fast exact math
-	uint32_t wheel_idx = global_id % 5760ULL;
-	uint64_t cycle = global_id / 5760ULL;
+	const uint32_t wheel_idx = global_id % 5760ULL;
+	const uint64_t cycle	 = global_id / 5760ULL;
 
 	// Initial candidate via the Constant Cache broadcast
 	uint64_t candidate = start_range + (cycle * 30030ULL) + c_wheel_30030[wheel_idx];
+
+	// wait for the tables to finish copying
+	__pipeline_commit();
+	__pipeline_wait_prior(0);
+	__syncthreads();
 
 	while (candidate < end_range)
 	{
@@ -482,273 +491,325 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		do
 		{
 			// Base 2
-			uint32_t p = __popcll(candidate);
+			const uint32_t p = __popcll(candidate);
 
 			// Base 4
-			uint32_t ds4 = p + __popcll(candidate & 0xAAAAAAAAAAAAAAAAULL);
+			const uint32_t ds4 = p + __popcll(candidate & 0xAAAAAAAAAAAAAAAAULL);
 
-			// check base 2 and base 4 simultaneously since chance of all threads in a warp
-			// failing at base 2 is tiny
-			if (!(s_sp[p] & s_sp[ds4]))
+			// check base 2 and base 4 simultaneously
+			if (!(local_sp[p] & local_sp[ds4]))
 				break;
 
 			// Base 16
 			if constexpr (MIN_BASE >= 16)
 			{
-				uint64_t ds16_64 = (candidate & 0x0F0F0F0F0F0F0F0FULL) + ((candidate >> 4) & 0x0F0F0F0F0F0F0F0FULL);
-				uint32_t ds16 = (uint32_t)((ds16_64 * 0x0101010101010101ULL) >> 56);
-				if (!s_sp[ds16])
-					break;
+				const uint32_t c_low = (uint32_t)candidate;
+				const uint32_t c_high = (uint32_t)(candidate >> 32);
+
+				const uint32_t n_low = (c_low & 0x0F0F0F0F) + ((c_low >> 4) & 0x0F0F0F0F);
+				const uint32_t n_high = (c_high & 0x0F0F0F0F) + ((c_high >> 4) & 0x0F0F0F0F);
+
+				// Sum the 8 bytes across two single-cycle instructions
+				const uint32_t ds16 = __dp4a(n_high, 0x01010101U, __dp4a(n_low, 0x01010101U, 0U));
+    
+				if (!local_sp[ds16]) break;
 			}
 
 			// Base 8
-			uint32_t ds8 = __popcll(candidate & 0x9249249249249249ULL) +
-					   (__popcll(candidate & 0x2492492492492492ULL) << 1) +
-					   (__popcll(candidate & 0x4924924924924924ULL) << 2);
-			if (!s_sp[ds8])
+			const uint32_t ds8 = __popcll(candidate & 0x9249249249249249ULL) +
+								(__popcll(candidate & 0x2492492492492492ULL) << 1) +
+								(__popcll(candidate & 0x4924924924924924ULL) << 2);
+			if (!local_sp[ds8])
 				break;
 
-			// Base 32 digit sum via 5-bit interleaved population counts
+			// Base 32
 			if constexpr (MIN_BASE >= 32)
 			{
-				uint32_t ds32 =
-				    __popcll(candidate & 0x1084210842108421ULL) +
-				    (__popcll(candidate & 0x2108421084210842ULL) << 1) +
-				    (__popcll(candidate & 0x4210842108421084ULL) << 2) +
-				    (__popcll(candidate & 0x8421084210842108ULL) << 3) +
-				    (__popcll(candidate & 0x0842108421084210ULL) << 4);
+				const uint32_t ds32 =
+					__popcll(candidate & 0x1084210842108421ULL) +
+					(__popcll(candidate & 0x2108421084210842ULL) << 1) +
+					(__popcll(candidate & 0x4210842108421084ULL) << 2) +
+					(__popcll(candidate & 0x8421084210842108ULL) << 3) +
+					(__popcll(candidate & 0x0842108421084210ULL) << 4);
 
-				if (!s_sp[ds32])
+				if (!local_sp[ds32])
 					break;
 			}
-
-			uint32_t sum, r, rq;
-			uint64_t r64, rq64;
-			uint64_t v_hi;
-			uint32_t v_low;
 
 			// --- Base 12 ---
 			if constexpr (MIN_BASE >= 12)
 			{
-				v_hi = candidate / 429981696ULL;
-				v_low = (uint32_t)(candidate - v_hi * 429981696ULL);
-				sum = 0;
-				r64 = v_hi;
-				rq64 = r64 / 20736ULL;
+				const uint64_t v_hi = candidate / 429981696ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 429981696ULL);
+
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 20736ULL;
 				sum += local_b12[r64 - rq64 * 20736ULL];
+
 				r64 = rq64;
-				r = (uint32_t)r64;
-				rq = r / 20736U;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 20736U;
 				sum += local_b12[r - rq * 20736U];
+
 				r = rq;
 				sum += local_b12[r];
+
 				r = v_low;
 				rq = r / 20736U;
 				sum += local_b12[r - rq * 20736U];
+
 				r = rq;
 				sum += local_b12[r];
-				if (!s_sp[sum])
+
+				if (!local_sp[sum])
 					break;
 			}
 
 			// --- Base 6 ---
-			v_hi = candidate / 2176782336ULL;
-			v_low = (uint32_t)(candidate - v_hi * 2176782336ULL);
-			sum = 0;
+			{
+				const uint64_t v_hi = candidate / 2176782336ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 2176782336ULL);
 
-			r64 = v_hi;
-			rq64 = r64 / 1296ULL;
-			sum += local_b6[r64 - rq64 * 1296ULL];
-			r64 = rq64;
-			r = (uint32_t)r64;
-			rq = r / 1296U;
-			sum += local_b6[r - rq * 1296U];
-			r = rq;
-			rq = r / 1296U;
-			sum += local_b6[r - rq * 1296U];
-			r = rq;
-			sum += local_b6[r];
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 1296ULL;
+				sum += local_b6[r64 - rq64 * 1296ULL];
 
-			r = v_low;
-			rq = r / 1296U;
-			sum += local_b6[r - rq * 1296U];
-			r = rq;
-			rq = r / 1296U;
-			sum += local_b6[r - rq * 1296U];
-			r = rq;
-			sum += local_b6[r];
-			if (!s_sp[sum])
-				break;
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 1296U;
+				sum += local_b6[r - rq * 1296U];
+
+				r = rq;
+				rq = r / 1296U;
+				sum += local_b6[r - rq * 1296U];
+
+				r = rq;
+				sum += local_b6[r];
+
+				r = v_low;
+				rq = r / 1296U;
+				sum += local_b6[r - rq * 1296U];
+
+				r = rq;
+				rq = r / 1296U;
+				sum += local_b6[r - rq * 1296U];
+
+				r = rq;
+				sum += local_b6[r];
+
+				if (!local_sp[sum])
+					break;
+			}
 
 			// --- Base 10 ---
 			if constexpr (MIN_BASE >= 10)
 			{
-				v_hi = candidate / 1000000000ULL;
-				v_low = (uint32_t)(candidate - v_hi * 1000000000ULL);
-				sum = 0;
+				const uint64_t v_hi = candidate / 1000000000ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 1000000000ULL);
 
-				r64 = v_hi;
-				rq64 = r64 / 10000ULL;
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 10000ULL;
 				sum += local_b10[r64 - rq64 * 10000ULL];
+
 				r64 = rq64;
-				r = (uint32_t)r64;
-				rq = r / 10000U;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 10000U;
 				sum += local_b10[r - rq * 10000U];
+
 				r = rq;
 				sum += local_b10[r];
 
 				r = v_low;
 				rq = r / 10000U;
 				sum += local_b10[r - rq * 10000U];
+
 				r = rq;
 				rq = r / 10000U;
 				sum += local_b10[r - rq * 10000U];
+
 				r = rq;
 				sum += local_b10[r];
-				if (!s_sp[sum])
+
+				if (!local_sp[sum])
 					break;
 			}
 
 			// --- Base 5 ---
-			v_hi = candidate / 244140625ULL;
-			v_low = (uint32_t)(candidate - v_hi * 244140625ULL);
-			sum = 0;
+			{
+				const uint64_t v_hi = candidate / 244140625ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 244140625ULL);
 
-			r64 = v_hi;
-			rq64 = r64 / 15625ULL;
-			sum += b5[r64 - rq64 * 15625ULL];
-			r64 = rq64;
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 15625ULL;
+				sum += __ldg(&b5[r64 - rq64 * 15625ULL]);
 
-			r = (uint32_t)r64;
-			rq = r / 15625U;
-			sum += b5[r - rq * 15625U];
-			r = rq;
-			sum += b5[r];
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 15625U;
+				sum += __ldg(&b5[r - rq * 15625U]);
 
-			r = v_low;
-			rq = r / 15625U;
-			sum += b5[r - rq * 15625U];
-			r = rq;
-			sum += b5[r];
-			if (!s_sp[sum])
-				break;
+				r = rq;
+				sum += __ldg(&b5[r]);
+
+				r = v_low;
+				rq = r / 15625U;
+				sum += __ldg(&b5[r - rq * 15625U]);
+
+				r = rq;
+				sum += __ldg(&b5[r]);
+
+				if (!local_sp[sum])
+					break;
+			}
 
 			// --- Base 9 ---
-			v_hi = candidate / 3486784401ULL;
-			v_low = (uint32_t)(candidate - v_hi * 3486784401ULL);
-			sum = 0;
+			{
+				const uint64_t v_hi = candidate / 3486784401ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 3486784401ULL);
 
-			r64 = v_hi;
-			rq64 = r64 / 6561ULL;
-			sum += b9[r64 - rq64 * 6561ULL];
-			r64 = rq64;
-			r = (uint32_t)r64;
-			rq = r / 6561U;
-			sum += b9[r - rq * 6561U];
-			r = rq;
-			sum += b9[r];
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 6561ULL;
+				sum += __ldg(&b9[r64 - rq64 * 6561ULL]);
 
-			r = v_low;
-			rq = r / 6561U;
-			sum += b9[r - rq * 6561U];
-			r = rq;
-			rq = r / 6561U;
-			sum += b9[r - rq * 6561U];
-			r = rq;
-			sum += b9[r];
-			if (!s_sp[sum])
-				break;
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 6561U;
+				sum += __ldg(&b9[r - rq * 6561U]);
+
+				r = rq;
+				sum += __ldg(&b9[r]);
+
+				r = v_low;
+				rq = r / 6561U;
+				sum += __ldg(&b9[r - rq * 6561U]);
+
+				r = rq;
+				rq = r / 6561U;
+				sum += __ldg(&b9[r - rq * 6561U]);
+
+				r = rq;
+				sum += __ldg(&b9[r]);
+
+				if (!local_sp[sum])
+					break;
+			}
 
 			// --- Base 3 ---
-			v_hi = candidate / 43046721ULL;
-			v_low = (uint32_t)(candidate - v_hi * 43046721ULL);
-			sum = 0;
+			{
+				const uint64_t v_hi = candidate / 43046721ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 43046721ULL);
 
-			r64 = v_hi;
-			rq64 = r64 / 6561ULL;
-			sum += b3[r64 - rq64 * 6561ULL];
-			r64 = rq64;
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 6561ULL;
+				sum += __ldg(&b3[r64 - rq64 * 6561ULL]);
 
-			r = (uint32_t)r64;
-			rq = r / 6561U;
-			sum += b3[r - rq * 6561U];
-			r = rq;
-			rq = r / 6561U;
-			sum += b3[r - rq * 6561U];
-			r = rq;
-			sum += b3[r];
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 6561U;
+				sum += __ldg(&b3[r - rq * 6561U]);
 
-			r = v_low;
-			rq = r / 6561U;
-			sum += b3[r - rq * 6561U];
-			r = rq;
-			sum += b3[r];
-			if (!s_sp[sum])
-				break;
+				r = rq;
+				rq = r / 6561U;
+				sum += __ldg(&b3[r - rq * 6561U]);
+
+				r = rq;
+				sum += __ldg(&b3[r]);
+
+				r = v_low;
+				rq = r / 6561U;
+				sum += __ldg(&b3[r - rq * 6561U]);
+
+				r = rq;
+				sum += __ldg(&b3[r]);
+
+				if (!local_sp[sum])
+					break;
+			}
 
 			// --- Base 11 ---
 			if constexpr (MIN_BASE >= 11)
 			{
-				v_hi = candidate / 2357947691ULL;
-				v_low = (uint32_t)(candidate - v_hi * 2357947691ULL);
-				sum = 0;
-				r64 = v_hi;
-				rq64 = r64 / 14641ULL;
+				const uint64_t v_hi = candidate / 2357947691ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 2357947691ULL);
+
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 14641ULL;
 				sum += __ldg(&b11[r64 - rq64 * 14641ULL]);
+
 				r64 = rq64;
-				r = (uint32_t)r64;
-				rq = r / 14641U;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 14641U;
 				sum += __ldg(&b11[r - rq * 14641U]);
+
 				r = rq;
 				sum += __ldg(&b11[r]);
+
 				r = v_low;
 				rq = r / 14641U;
 				sum += __ldg(&b11[r - rq * 14641U]);
+
 				r = rq;
 				rq = r / 14641U;
 				sum += __ldg(&b11[r - rq * 14641U]);
+
 				r = rq;
 				sum += __ldg(&b11[r]);
-				if (!s_sp[sum])
+
+				if (!local_sp[sum])
 					break;
 			}
 
 			// --- Base 7 ---
-			v_hi = candidate / 1977326743ULL;
-			v_low = (uint32_t)(candidate - v_hi * 1977326743ULL);
-			sum = 0;
+			{
+				const uint64_t v_hi = candidate / 1977326743ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 1977326743ULL);
 
-			r64 = v_hi;
-			rq64 = r64 / 2401ULL;
-			sum += b7[r64 - rq64 * 2401ULL];
-			r64 = rq64;
-			r = (uint32_t)r64;
-			rq = r / 2401U;
-			sum += b7[r - rq * 2401U];
-			r = rq;
-			sum += b7[r];
+				uint32_t sum = 0;
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 2401ULL;
+				sum += __ldg(&b7[r64 - rq64 * 2401ULL]);
 
-			r = v_low;
-			rq = r / 2401U;
-			sum += b7[r - rq * 2401U];
-			r = rq;
-			rq = r / 2401U;
-			sum += b7[r - rq * 2401U];
-			r = rq;
-			sum += b7[r];
-			if (!s_sp[sum])
-				break;
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 2401U;
+				sum += __ldg(&b7[r - rq * 2401U]);
+
+				r = rq;
+				sum += __ldg(&b7[r]);
+
+				r = v_low;
+				rq = r / 2401U;
+				sum += __ldg(&b7[r - rq * 2401U]);
+
+				r = rq;
+				rq = r / 2401U;
+				sum += __ldg(&b7[r - rq * 2401U]);
+
+				r = rq;
+				sum += __ldg(&b7[r]);
+
+				if (!local_sp[sum])
+					break;
+			}
 
 			// If we successfully run the gauntlet without breaking:
 			pass = true;
 		} while (0);
 
-		uint32_t warp_mask = __ballot_sync(0xFFFFFFFF, pass);
+		const uint32_t warp_mask = __ballot_sync(0xFFFFFFFF, pass);
 		if (warp_mask)
 		{
-			uint32_t warp_count = __popc(warp_mask);
+			const uint32_t warp_count = __popc(warp_mask);
+			const uint32_t elect_lane = __ffs(warp_mask) - 1; // lowest set bit = first active lane
+			const uint32_t lane_id = threadIdx.x & 31;
 			uint32_t base_idx = 0;
-			uint32_t elect_lane = __ffs(warp_mask) - 1; // lowest set bit = first active lane
 
 			if (lane_id == elect_lane)
 			{
@@ -756,8 +817,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			}
 			base_idx = __shfl_sync(0xFFFFFFFF, base_idx, elect_lane);
 
-			// Use Constant Memory lookup to replace the SHF/SUB latency
-			uint32_t local_offset = __popc(warp_mask & c_lane_mask[lane_id]);
+			const uint32_t local_offset = __popc(warp_mask & c_lane_mask[lane_id]);
 			if (pass && base_idx + local_offset < MAX_GPU_RESULTS)
 			{
 				d_results[base_idx + local_offset] = candidate;
