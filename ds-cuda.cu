@@ -516,21 +516,21 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			}
 
 			// Base 8
-			const uint32_t ds8 = __popcll(candidate & 0x9249249249249249ULL) +
-								(__popcll(candidate & 0x2492492492492492ULL) << 1) +
-								(__popcll(candidate & 0x4924924924924924ULL) << 2);
+			const uint32_t b1 = __popcll(candidate & 0x2492492492492492ULL);
+			const uint32_t b2 = __popcll(candidate & 0x4924924924924924ULL);
+			const uint32_t ds8 = (p - b1 - b2) + (b1 << 1) + (b2 << 2);
+
 			if (!local_sp[ds8])
 				break;
 
 			// Base 32
 			if constexpr (MIN_BASE >= 32)
 			{
-				const uint32_t ds32 =
-					__popcll(candidate & 0x1084210842108421ULL) +
-					(__popcll(candidate & 0x2108421084210842ULL) << 1) +
-					(__popcll(candidate & 0x4210842108421084ULL) << 2) +
-					(__popcll(candidate & 0x8421084210842108ULL) << 3) +
-					(__popcll(candidate & 0x0842108421084210ULL) << 4);
+				const uint32_t b1 = __popcll(candidate & 0x2108421084210842ULL);
+				const uint32_t b2 = __popcll(candidate & 0x4210842108421084ULL);
+				const uint32_t b3 = __popcll(candidate & 0x8421084210842108ULL);
+				const uint32_t b4 = __popcll(candidate & 0x0842108421084210ULL);
+				const uint32_t ds32 = (p - b1 - b2 - b3 - b4) + (b1 << 1) + (b2 << 2) + (b3 << 3) + (b4 << 4);
 
 				if (!local_sp[ds32])
 					break;
