@@ -519,7 +519,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			// Base 8
 			const uint32_t b1 = __popcll(candidate & 0x2492492492492492ULL);
 			const uint32_t b2 = __popcll(candidate & 0x4924924924924924ULL);
-			const uint32_t ds8 = (p - b1 - b2) + (b1 << 1) + (b2 << 2);
+			const uint32_t ds8 = p + b1 + b2 + (b2 << 1);
 
 			if (!local_sp[ds8])
 				break;
@@ -531,7 +531,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				const uint32_t b2 = __popcll(candidate & 0x4210842108421084ULL);
 				const uint32_t b3 = __popcll(candidate & 0x8421084210842108ULL);
 				const uint32_t b4 = __popcll(candidate & 0x0842108421084210ULL);
-				const uint32_t ds32 = (p - b1 - b2 - b3 - b4) + (b1 << 1) + (b2 << 2) + (b3 << 3) + (b4 << 4);
+				const uint32_t ds32 = p + b1 + ((b2 << 1) + b2) + ((b3 << 3) - b3) + ((b4 << 4) - b4);
 
 				if (!local_sp[ds32])
 					break;
