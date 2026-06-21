@@ -8,8 +8,8 @@
 //    multiple of 2, 3, 5, 7, 11, or 13 (this rejects 80.82% of candidates)
 // 2. Checking if the digit sums are prime in the following
 //    bases in this order: (powers of two) 2, 4, 16, 8, 32,
-//                         (even bases)    12, 6, 10,
-//                         (odd bases)     5, 9, 3, 11, 7
+//                         (even bases)    12, 6, 10, 14,
+//                         (odd bases)     5, 9, 3, 11, 7, 13, 15
 // The powers of two use popcount instructions with a small
 // prime lookup array.
 // The even and odd bases use radix chunking narrowing to
@@ -101,15 +101,30 @@ const uint32_t base11Size = 11 * 11 * 11 * 11;
 // base 12
 const uint32_t base12Size = 12 * 12 * 12 * 12;
 
+// base 13
+const uint32_t base13Size = 13 * 13 * 13 * 13;
+
+// base 14
+const uint32_t base14Size = 14 * 14 * 14 * 14;
+
+// base 15
+const uint32_t base15Size = 15 * 15 * 15 * 15;
+
+// memory alignment in bytes -1
+const uint32_t ALIGN = 127;
+
 // bases 16 byte aligned
-const uint32_t base3Size16 = (base3Size + 15) & ~15;
-const uint32_t base5Size16 = (base5Size + 15) & ~15;
-const uint32_t base6Size16 = (base6Size + 15) & ~15;
-const uint32_t base7Size16 = (base7Size + 15) & ~15;
-const uint32_t base9Size16 = (base9Size + 15) & ~15;
-const uint32_t base10Size16 = (base10Size + 15) & ~15;
-const uint32_t base11Size16 = (base11Size + 15) & ~15;
-const uint32_t base12Size16 = (base12Size + 15) & ~15;
+const uint32_t base3Size16 = (base3Size + ALIGN) & ~ALIGN;
+const uint32_t base5Size16 = (base5Size + ALIGN) & ~ALIGN;
+const uint32_t base6Size16 = (base6Size + ALIGN) & ~ALIGN;
+const uint32_t base7Size16 = (base7Size + ALIGN) & ~ALIGN;
+const uint32_t base9Size16 = (base9Size + ALIGN) & ~ALIGN;
+const uint32_t base10Size16 = (base10Size + ALIGN) & ~ALIGN;
+const uint32_t base11Size16 = (base11Size + ALIGN) & ~ALIGN;
+const uint32_t base12Size16 = (base12Size + ALIGN) & ~ALIGN;
+const uint32_t base13Size16 = (base13Size + ALIGN) & ~ALIGN;
+const uint32_t base14Size16 = (base14Size + ALIGN) & ~ALIGN;
+const uint32_t base15Size16 = (base15Size + ALIGN) & ~ALIGN;
 
 // --- Host Verification ---
 static uint64_t mulmod(uint64_t a, uint64_t b, uint64_t n)
@@ -379,27 +394,27 @@ void logRecord(uint32_t base, uint64_t candidate)
 
 void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t subblock_size, uint32_t current_base, uint32_t max_base)
 {
-      std::lock_guard<std::mutex> lock(file_mutex);
+	std::lock_guard<std::mutex> lock(file_mutex);
 
-      // Open in overwrite mode ("w") so it only stores the latest state
-      FILE *f = fopen("ds_state.txt", "w");
-      if (f != NULL)
-      {
-            time_t rawtime;
-            struct tm *timeinfo;
-            char buffer[80];
-            time(&rawtime);
-            timeinfo = localtime(&rawtime);
-            strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+	// Open in overwrite mode ("w") so it only stores the latest state
+	FILE *f = fopen("ds_state.txt", "w");
+	if (f != NULL)
+	{
+		time_t rawtime;
+		struct tm *timeinfo;
+		char buffer[80];
+		time(&rawtime);
+		timeinfo = localtime(&rawtime);
+		strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
 
-            fprintf(f, "--- ENGINE HEARTBEAT ---\n");
-            fprintf(f, "Last Saved: %s\n", buffer);
-            fprintf(f, "Restart Command Args:\n");
-            // Print the exact arguments you need to paste into the terminal to resume
-            fprintf(f, ".\\ds %" PRIu64 " %" PRIu64 " %" PRIu64 " %u %u\n", 
-                    completed_block + 1, end_block, subblock_size, current_base, max_base);
-            fclose(f);
-      }
+		fprintf(f, "--- ENGINE HEARTBEAT ---\n");
+		fprintf(f, "Last Saved: %s\n", buffer);
+		fprintf(f, "Restart Command Args:\n");
+		// Print the exact arguments you need to paste into the terminal to resume
+		fprintf(f, ".\\ds %" PRIu64 " %" PRIu64 " %" PRIu64 " %u %u\n",
+			  completed_block + 1, end_block, subblock_size, current_base, max_base);
+		fclose(f);
+	}
 }
 
 // ------------------------------------------------------------------------------------
@@ -412,62 +427,64 @@ __constant__ uint32_t c_lane_mask[32];	 // Pre-calculated offset masks for warp 
 // This is the GPU kernel that filters candidate numbers
 template <uint32_t MIN_BASE>
 __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
-	const uint64_t start_range, const uint64_t total_numbers, const uint64_t end_range,
-	const uint8_t *__restrict__ g_sp, const uint32_t sp_size,
-	uint64_t *__restrict__ d_results, uint32_t *__restrict__ d_count,
-	const uint8_t *__restrict__ b3, const uint8_t *__restrict__ b5,
-	const uint8_t *__restrict__ b6, const uint8_t *__restrict__ b7,
-	const uint8_t *__restrict__ b9, const uint8_t *__restrict__ b10,
-	const uint8_t *__restrict__ b11, const uint8_t *__restrict__ b12,
-	const uint64_t stride)
+    const uint64_t start_range, const uint64_t total_numbers, const uint64_t end_range,
+    const uint8_t *__restrict__ g_sp, const uint32_t sp_size,
+    uint64_t *__restrict__ d_results, uint32_t *__restrict__ d_count,
+    const uint8_t *__restrict__ b3, const uint8_t *__restrict__ b5,
+    const uint8_t *__restrict__ b6, const uint8_t *__restrict__ b7,
+    const uint8_t *__restrict__ b9, const uint8_t *__restrict__ b10,
+    const uint8_t *__restrict__ b11, const uint8_t *__restrict__ b12,
+    const uint8_t *__restrict__ b13, const uint8_t *__restrict__ b14,
+    const uint8_t *__restrict__ b15,
+    const uint64_t stride)
 {
 	// --- SHARED MEMORY ALLOCATION BLOCK ---
 	extern __shared__ uint8_t s_mem[];
 
 	// Constant pointers to mutable shared memory during initialization
-	uint8_t * const s_sp  = s_mem;
-	uint8_t * const s_b12 = s_sp + sp_size;
-	uint8_t * const s_b6  = s_b12 + base12Size16;
-	uint8_t * const s_b10 = s_b6 + base6Size16;
+	uint8_t *const s_sp = s_mem;
+	uint8_t *const s_b12 = s_sp + sp_size;
+	uint8_t *const s_b6 = s_b12 + base12Size16;
+	uint8_t *const s_b10 = s_b6 + base6Size16;
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
 	// Scoped heavily to allow const parameters on iterators and pointers
 	{
-		uint4 * const shared = (uint4 *)s_sp;
-		const uint4 * const global = (const uint4 *)g_sp;
+		uint4 *const shared = (uint4 *)s_sp;
+		const uint4 *const global = (const uint4 *)g_sp;
 		const uint32_t words = sp_size >> 4;
 		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 			__pipeline_memcpy_async(&shared[i], &global[i], 16);
 	}
 
 	{
-		uint4 * const shared = (uint4 *)s_b6;
-		const uint4 * const global = (const uint4 *)b6;
+		uint4 *const shared = (uint4 *)s_b6;
+		const uint4 *const global = (const uint4 *)b6;
 		const uint32_t words = base6Size16 >> 4;
 		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 			__pipeline_memcpy_async(&shared[i], &global[i], 16);
 	}
 
 	{
-		uint4 * const shared = (uint4 *)s_b10;
-		const uint4 * const global = (const uint4 *)b10;
+		uint4 *const shared = (uint4 *)s_b10;
+		const uint4 *const global = (const uint4 *)b10;
 		const uint32_t words = base10Size16 >> 4;
 		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 			__pipeline_memcpy_async(&shared[i], &global[i], 16);
 	}
 
 	{
-		uint4 * const shared = (uint4 *)s_b12;
-		const uint4 * const global = (const uint4 *)b12;
+		uint4 *const shared = (uint4 *)s_b12;
+		const uint4 *const global = (const uint4 *)b12;
 		const uint32_t words = base12Size16 >> 4;
 		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
 			__pipeline_memcpy_async(&shared[i], &global[i], 16);
 	}
 
 	// Re-alias to strictly const data pointers for the compute phase
-	const uint8_t *__restrict__ const local_sp  = s_sp;
+	const uint8_t *__restrict__ const local_sp = s_sp;
 	const uint8_t *__restrict__ const local_b12 = s_b12;
-	const uint8_t *__restrict__ const local_b6  = s_b6;
+	const uint8_t *__restrict__ const local_b6 = s_b6;
 	const uint8_t *__restrict__ const local_b10 = s_b10;
 
 	// Calculate global thread mapping for Wheel 30030
@@ -475,7 +492,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 	// Fast exact math
 	const uint32_t wheel_idx = global_id % 5760ULL;
-	const uint64_t cycle	 = global_id / 5760ULL;
+	const uint64_t cycle = global_id / 5760ULL;
 
 	// Initial candidate via the Constant Cache broadcast
 	uint64_t candidate = start_range + (cycle * 30030ULL) + c_wheel_30030[wheel_idx];
@@ -512,8 +529,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 				// Sum the 8 bytes across two single-cycle instructions
 				const uint32_t ds16 = __dp4a(n_high, 0x01010101U, __dp4a(n_low, 0x01010101U, 0U));
-    
-				if (!local_sp[ds16]) break;
+
+				if (!local_sp[ds16])
+					break;
 			}
 
 			// Base 8
@@ -633,6 +651,43 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 				r = rq;
 				sum += local_b10[r];
+
+				if (!local_sp[sum])
+					break;
+			}
+
+			// --- Base 14 ---
+			if constexpr (MIN_BASE >= 14)
+			{
+				// 14^8 = 1,475,789,056
+				const uint64_t v_hi = candidate / 1475789056ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 1475789056ULL);
+
+				uint32_t sum = 0;
+
+				// Chunking factor 14^4 = 38416
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 38416ULL;
+				sum += __ldg(&b14[r64 - rq64 * 38416ULL]);
+
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 38416U;
+				sum += __ldg(&b14[r - rq * 38416U]);
+
+				r = rq;
+				sum += __ldg(&b14[r]);
+
+				r = v_low;
+				rq = r / 38416U;
+				sum += __ldg(&b14[r - rq * 38416U]);
+
+				r = rq;
+				rq = r / 38416U;
+				sum += __ldg(&b14[r - rq * 38416U]);
+
+				r = rq;
+				sum += __ldg(&b14[r]);
 
 				if (!local_sp[sum])
 					break;
@@ -800,6 +855,80 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 					break;
 			}
 
+			// --- Base 13 ---
+			if constexpr (MIN_BASE >= 13)
+			{
+				// 13^8 = 815,730,721
+				const uint64_t v_hi = candidate / 815730721ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 815730721ULL);
+
+				uint32_t sum = 0;
+
+				// Chunking factor 13^4 = 28561
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 28561ULL;
+				sum += __ldg(&b13[r64 - rq64 * 28561ULL]);
+
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 28561U;
+				sum += __ldg(&b13[r - rq * 28561U]);
+
+				r = rq;
+				sum += __ldg(&b13[r]);
+
+				r = v_low;
+				rq = r / 28561U;
+				sum += __ldg(&b13[r - rq * 28561U]);
+
+				r = rq;
+				rq = r / 28561U;
+				sum += __ldg(&b13[r - rq * 28561U]);
+
+				r = rq;
+				sum += __ldg(&b13[r]);
+
+				if (!local_sp[sum])
+					break;
+			}
+
+			// --- Base 15 ---
+			if constexpr (MIN_BASE >= 15)
+			{
+				// 15^8 = 2,562,890,625
+				const uint64_t v_hi = candidate / 2562890625ULL;
+				const uint32_t v_low = (uint32_t)(candidate - v_hi * 2562890625ULL);
+
+				uint32_t sum = 0;
+
+				// Chunking factor 15^4 = 50625
+				uint64_t r64 = v_hi;
+				uint64_t rq64 = r64 / 50625ULL;
+				sum += __ldg(&b15[r64 - rq64 * 50625ULL]);
+
+				r64 = rq64;
+				uint32_t r = (uint32_t)r64;
+				uint32_t rq = r / 50625U;
+				sum += __ldg(&b15[r - rq * 50625U]);
+
+				r = rq;
+				sum += __ldg(&b15[r]);
+
+				r = v_low;
+				rq = r / 50625U;
+				sum += __ldg(&b15[r - rq * 50625U]);
+
+				r = rq;
+				rq = r / 50625U;
+				sum += __ldg(&b15[r - rq * 50625U]);
+
+				r = rq;
+				sum += __ldg(&b15[r]);
+
+				if (!local_sp[sum])
+					break;
+			}
+
 			// If we successfully run the gauntlet without breaking:
 			pass = true;
 		} while (0);
@@ -880,7 +1009,7 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 						checked_by_gpu = true;
 
 					// Modulo Bases handled by GPU
-					if (b == 3 || b == 5 || b == 6 || b == 7 || b == 9 || b == 10 || b == 11 || b == 12)
+					if (b == 3 || b == 5 || b == 6 || b == 7 || b == 9 || b == 10 || b == 11 || b == 12 || b == 13 || b == 14 || b == 15)
 						checked_by_gpu = true;
 				}
 
@@ -1089,6 +1218,18 @@ int main(int argc, char **argv)
 	for (int i = 0; i < base12Size; i++)
 		h_base12[i] = sumDigits(i, 12);
 
+	uint8_t h_base13[base13Size];
+	for (int i = 0; i < base13Size; i++)
+		h_base13[i] = sumDigits(i, 13);
+
+	uint8_t h_base14[base14Size];
+	for (int i = 0; i < base14Size; i++)
+		h_base14[i] = sumDigits(i, 14);
+
+	uint8_t h_base15[base15Size];
+	for (int i = 0; i < base15Size; i++)
+		h_base15[i] = sumDigits(i, 15);
+
 	// Setup Wheel 30030 and masks in Constant Memory ---
 	uint16_t h_wheel_30030[5760];
 	int w_idx = 0;
@@ -1108,7 +1249,7 @@ int main(int argc, char **argv)
 	}
 	CUDA_CHECK(cudaMemcpyToSymbol(c_lane_mask, h_lane_mask, sizeof(h_lane_mask)));
 
-	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12;
+	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12, *d_b13, *d_b14, *d_b15;
 	CUDA_CHECK(cudaMalloc((void **)&d_sp, sp_bytes));
 	CUDA_CHECK(cudaMalloc((void **)&d_b3, base3Size16)); // Expanded allocation
 	CUDA_CHECK(cudaMalloc((void **)&d_b5, base5Size16)); // Expanded allocation
@@ -1118,6 +1259,9 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaMalloc((void **)&d_b10, base10Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b11, base11Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b12, base12Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b13, base13Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b14, base14Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b15, base15Size16));
 
 	CUDA_CHECK(cudaMemcpy(d_sp, global_smallprimes, sp_bytes, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_b3, h_base3, base3Size, cudaMemcpyHostToDevice));
@@ -1128,6 +1272,9 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaMemcpy(d_b10, h_base10, base10Size, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_b11, h_base11, base11Size, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_b12, h_base12, base12Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b13, h_base13, base13Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b14, h_base14, base14Size, cudaMemcpyHostToDevice));
+	CUDA_CHECK(cudaMemcpy(d_b15, h_base15, base15Size, cudaMemcpyHostToDevice));
 
 	uint64_t *d_results_A, *d_results_B;
 	uint32_t *d_count_A, *d_count_B;
@@ -1267,39 +1414,39 @@ int main(int argc, char **argv)
 		{
 			if (mb >= 32)
 			{
-				unifiedSearchKernel<32><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+				unifiedSearchKernel<32><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 			}
 			else if (mb >= 16)
 			{
-				unifiedSearchKernel<16><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+				unifiedSearchKernel<16><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 			}
 			else
 			{
 				switch (mb)
 				{
 				case 9:
-					unifiedSearchKernel<9><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<9><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				case 10:
-					unifiedSearchKernel<10><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<10><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				case 11:
-					unifiedSearchKernel<11><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<11><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				case 12:
-					unifiedSearchKernel<12><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<12><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				case 13:
-					unifiedSearchKernel<13><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<13><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				case 14:
-					unifiedSearchKernel<14><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<14><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				case 15:
-					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				default:
-					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, stride);
+					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
 					break;
 				}
 			}
@@ -1484,6 +1631,9 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaFree(d_b10));
 	CUDA_CHECK(cudaFree(d_b11));
 	CUDA_CHECK(cudaFree(d_b12));
+	CUDA_CHECK(cudaFree(d_b13));
+	CUDA_CHECK(cudaFree(d_b14));
+	CUDA_CHECK(cudaFree(d_b15));
 	CUDA_CHECK(cudaFree(d_results_A));
 	CUDA_CHECK(cudaFree(d_results_B));
 	CUDA_CHECK(cudaFree(d_count_A));
