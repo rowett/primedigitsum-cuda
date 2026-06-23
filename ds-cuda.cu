@@ -64,6 +64,10 @@ std::string formatCommas(uint64_t num)
 // Maximum number of candidates returned by the GPU
 #define MAX_GPU_RESULTS 20000000ULL
 
+// Maximum base to check
+#define MAX_BASE 64
+
+// Wrap Cuda calls in this to display failures
 #define CUDA_CHECK(call)                                                           \
 	do                                                                           \
 	{                                                                            \
@@ -76,44 +80,44 @@ std::string formatCommas(uint64_t num)
 		}                                                                      \
 	} while (0)
 
-// constants for digit sum chunking
-// base 3 widened
+// Constants for digit sum chunking
+// Base 3 (8 digits)
 const uint32_t base3Size = 3 * 3 * 3 * 3 * 3 * 3 * 3 * 3;
 
-// base 5 widened
+// Base 5 (6 digits)
 const uint32_t base5Size = 5 * 5 * 5 * 5 * 5 * 5;
 
-// base 6
+// Base 6 (4 digits)
 const uint32_t base6Size = 6 * 6 * 6 * 6;
 
-// base 7
+// Base 7 (4 digits)
 const uint32_t base7Size = 7 * 7 * 7 * 7;
 
-// base 9
+// Base 9 (4 digits)
 const uint32_t base9Size = 9 * 9 * 9 * 9;
 
-// base 10
+// Base 10 (4 digits)
 const uint32_t base10Size = 10 * 10 * 10 * 10;
 
-// base 11
+// Base 11 (4 digits)
 const uint32_t base11Size = 11 * 11 * 11 * 11;
 
-// base 12
+// Base 12 (4 digits)
 const uint32_t base12Size = 12 * 12 * 12 * 12;
 
-// base 13
+// Base 13 (4 digits)
 const uint32_t base13Size = 13 * 13 * 13 * 13;
 
-// base 14
+// Base 14 (4 digits)
 const uint32_t base14Size = 14 * 14 * 14 * 14;
 
-// base 15
+// Base 15 (4 digits)
 const uint32_t base15Size = 15 * 15 * 15 * 15;
 
-// memory alignment in bytes -1
+// Memory alignment in bytes -1
 const uint32_t ALIGN = 127;
 
-// bases 16 byte aligned
+// Bases byte aligned
 const uint32_t base3Size16 = (base3Size + ALIGN) & ~ALIGN;
 const uint32_t base5Size16 = (base5Size + ALIGN) & ~ALIGN;
 const uint32_t base6Size16 = (base6Size + ALIGN) & ~ALIGN;
@@ -126,7 +130,7 @@ const uint32_t base13Size16 = (base13Size + ALIGN) & ~ALIGN;
 const uint32_t base14Size16 = (base14Size + ALIGN) & ~ALIGN;
 const uint32_t base15Size16 = (base15Size + ALIGN) & ~ALIGN;
 
-// --- Host Verification ---
+// Host Verification
 static uint64_t mulmod(uint64_t a, uint64_t b, uint64_t n)
 {
 	uint64_t high, low, remainder;
@@ -238,7 +242,8 @@ uint64_t sumDigits(uint64_t value, const uint32_t radix)
 	return sum;
 }
 
-// 1. The Templated (Compile-Time) version of sumDigits
+// The Templated (Compile-Time) version of sumDigits
+// Compiler will replace constant division for better performance
 template <uint32_t RADIX>
 inline uint64_t sumDigitsConst(uint64_t value)
 {
@@ -251,7 +256,7 @@ inline uint64_t sumDigitsConst(uint64_t value)
 	return sum;
 }
 
-// 2. The Router to force compile-time evaluation
+// The Router to force compile-time evaluation
 inline uint64_t sumDigitsFast(uint64_t value, uint32_t radix)
 {
 	switch (radix)
@@ -335,7 +340,8 @@ inline uint64_t sumDigitsFast(uint64_t value, uint32_t radix)
 	case 40:
 		return sumDigitsConst<40>(value);
 	default:
-		return sumDigits(value, radix); // Fallback to slow division if base > 40
+		// Fallback to slow division if base > 40
+		return sumDigits(value, radix);
 	}
 }
 
@@ -372,6 +378,7 @@ std::condition_variable pool_cv;
 
 std::mutex file_mutex; // Protects file I/O
 
+// Log a new record
 void logRecord(uint32_t base, uint64_t candidate)
 {
 	std::lock_guard<std::mutex> lock(file_mutex);
@@ -392,6 +399,7 @@ void logRecord(uint32_t base, uint64_t candidate)
 	}
 }
 
+// Save the progress
 void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t subblock_size, uint32_t current_base, uint32_t max_base)
 {
 	std::lock_guard<std::mutex> lock(file_mutex);
@@ -410,21 +418,17 @@ void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t s
 		fprintf(f, "--- ENGINE HEARTBEAT ---\n");
 		fprintf(f, "Last Saved: %s\n", buffer);
 		fprintf(f, "Restart Command Args:\n");
-		// Print the exact arguments you need to paste into the terminal to resume
 		fprintf(f, ".\\ds %" PRIu64 " %" PRIu64 " %" PRIu64 " %u %u\n",
 			  completed_block + 1, end_block, subblock_size, current_base, max_base);
 		fclose(f);
 	}
 }
 
-// ------------------------------------------------------------------------------------
-// SILICON WALL CONSTANTS: Wheel 30030 and Warp Masks explicitly placed in Constant Bank
-// ------------------------------------------------------------------------------------
-
+// Prime wheel 30030 offsets
 __constant__ uint16_t c_wheel_30030[5760]; // 5760 offsets coprime to 2, 3, 5, 7, 11, and 13 (Takes 11.5 KB)
-__constant__ uint32_t c_lane_mask[32];	 // Pre-calculated offset masks for warp counting
 
 // This is the GPU kernel that filters candidate numbers
+// It's templated on minimum base to remove rendundant base checks at lower bases
 template <uint32_t MIN_BASE>
 __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
     const uint64_t start_range, const uint64_t total_numbers, const uint64_t end_range,
@@ -438,7 +442,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
     const uint8_t *__restrict__ b15,
     const uint64_t stride)
 {
-	// --- SHARED MEMORY ALLOCATION BLOCK ---
+	// Shared memory
 	extern __shared__ uint8_t s_mem[];
 
 	// Constant pointers to mutable shared memory during initialization
@@ -448,7 +452,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	uint8_t *const s_b10 = s_b6 + base6Size16;
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
-	// Scoped heavily to allow const parameters on iterators and pointers
+	// Only bases 12, 6, and 10 are promoted to shared memory here -- these were
+	// empirically confirmed to be the highest-traffic filters worth the shared
+	// memory budget; the small-primes table is also promoted since every base
+	// check indexes into it. Bases 5, 9, 3, 7, 11, 13, 14, 15 stay in global
+	// memory and are read through __ldg() instead (see below).
+	// Scoped to allow const parameters on iterators and pointers
 	{
 		uint4 *const shared = (uint4 *)s_sp;
 		const uint4 *const global = (const uint4 *)g_sp;
@@ -490,31 +499,35 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	// Calculate global thread mapping for Wheel 30030
 	const uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
-	// Fast exact math
+	// Constant division will be replaced by the compiler for speed
 	const uint32_t wheel_idx = global_id % 5760ULL;
 	const uint64_t cycle = global_id / 5760ULL;
 
 	// Initial candidate via the Constant Cache broadcast
 	uint64_t candidate = start_range + (cycle * 30030ULL) + c_wheel_30030[wheel_idx];
 
-	// wait for the tables to finish copying
+	// Wait for the tables to finish copying
 	__pipeline_commit();
 	__pipeline_wait_prior(0);
 	__syncthreads();
 
+	// Test each candidate
 	while (candidate < end_range)
 	{
 		bool pass = false;
 
+		// Check digit sum primality
+		// Base order is optimal for filter strength and check cost
 		do
 		{
+			// Power of 2 bases have very low cost
 			// Base 2
 			const uint32_t p = __popcll(candidate);
 
 			// Base 4
 			const uint32_t ds4 = p + __popcll(candidate & 0xAAAAAAAAAAAAAAAAULL);
 
-			// check base 2 and base 4 simultaneously
+			// Check base 2 and base 4 simultaneously (good for ILP)
 			if (!(local_sp[p] & local_sp[ds4]))
 				break;
 
@@ -554,6 +567,16 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				if (!local_sp[ds32])
 					break;
 			}
+
+			// Remaining even bases are stronger filters than odd bases
+			// Each filter from here uses division by constants which are replaced by the compiler
+			// and narrow to 32 bit as soon as possible
+
+			// NOTE on gating: bases 2, 4, 8, 3, 6, 5, 9, 7 are checked
+			// UNCONDITIONALLY regardless of MIN_BASE (they're cheap and always in
+			// scope). Bases 16, 32, 12, 10, 14, 11, 13, 15 are gated by
+			// `if constexpr (MIN_BASE >= N)` and compiled out entirely for kernel
+			// instantiations targeting a lower MIN_BASE.
 
 			// --- Base 12 ---
 			if constexpr (MIN_BASE >= 12)
@@ -929,28 +952,21 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 					break;
 			}
 
-			// If we successfully run the gauntlet without breaking:
+			// If we successfully run the gauntlet without breaking
 			pass = true;
 		} while (0);
 
-		const uint32_t warp_mask = __ballot_sync(0xFFFFFFFF, pass);
-		if (warp_mask)
+		// Check if the guantlet was passed
+		// (no point using __ballot_sync() since chance of multiple threads passing is tiny)
+		if (pass)
 		{
-			const uint32_t warp_count = __popc(warp_mask);
-			const uint32_t elect_lane = __ffs(warp_mask) - 1; // lowest set bit = first active lane
-			const uint32_t lane_id = threadIdx.x & 31;
-			uint32_t base_idx = 0;
+			// Add candidate to the result list
+			uint32_t idx = atomicAdd(d_count, 1);
 
-			if (lane_id == elect_lane)
+			// Ensure result buffer doesn't overflow
+			if (idx < MAX_GPU_RESULTS)
 			{
-				base_idx = atomicAdd(d_count, warp_count);
-			}
-			base_idx = __shfl_sync(0xFFFFFFFF, base_idx, elect_lane);
-
-			const uint32_t local_offset = __popc(warp_mask & c_lane_mask[lane_id]);
-			if (pass && base_idx + local_offset < MAX_GPU_RESULTS)
-			{
-				d_results[base_idx + local_offset] = candidate;
+				d_results[idx] = candidate;
 			}
 		}
 
@@ -979,7 +995,7 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 			verification_queue.pop();
 		}
 
-		// THE BARRIER: Wait for the DMA transfer to physically finish across the PCIe bus
+		// Wait for the DMA transfer to physically finish across the PCIe bus
 		CUDA_CHECK(cudaEventSynchronize(task.bundle.ready_event));
 
 		auto start_time = std::chrono::high_resolution_clock::now();
@@ -991,10 +1007,8 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 			uint32_t current_needed = global_minbase.load();
 			uint32_t max_fast_check = std::min(current_needed, max_target_base);
 
-			// ---------------------------------------------------------
-			// BUILD THE DYNAMIC CHECKLIST (Handles non-sequential gaps)
-			// ---------------------------------------------------------
-			uint8_t bases_to_check[64];
+			// Build the dynamic checklist to handles non-sequential gaps
+			uint8_t bases_to_check[MAX_BASE];
 			uint32_t check_count = 0;
 
 			for (uint32_t b = 2; b <= max_fast_check; ++b)
@@ -1019,7 +1033,7 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 				}
 			}
 
-			// 1. Initial array pre-filter based on the block's launch state
+			// Initial array pre-filter based on the block's launch state
 			for (uint32_t i = 0; i < task.candidate_count; i++)
 			{
 				uint64_t candidate = task.bundle.memory[i];
@@ -1028,7 +1042,6 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 
 				bool survived = true;
 
-				// Un-branched, sequentially accessed L1 cache loop
 				for (uint32_t c = 0; c < check_count; ++c)
 				{
 					uint32_t b = bases_to_check[c];
@@ -1039,14 +1052,16 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 					}
 				}
 
+				// Add any survivors to the survivor list
 				if (survived)
 					survivors.push_back(candidate);
 			}
 
+			// Sort the survivors to ensure "ds(n) is the smallest prime" is enforced
 			survivor_count = survivors.size();
 			std::sort(survivors.begin(), survivors.end());
 
-			// 2. The Dynamic Record Hunt
+			// The Dynamic Record Hunt
 			for (uint64_t candidate : survivors)
 			{
 				uint32_t current_expected = global_minbase.load();
@@ -1075,7 +1090,6 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 						continue; // Fast Rejection! CPU primality test bypassed.
 					highest_checked = current_expected;
 				}
-				// ------------------------
 
 				// Candidate satisfies all bases up to current_expected. Now do the heavy math.
 				if (!cpu_isPrime(candidate))
@@ -1173,6 +1187,15 @@ int main(int argc, char **argv)
 	global_minbase.store(strtoul(argv[4], NULL, 10));
 	uint32_t max_target_base = strtoul(argv[5], NULL, 10);
 
+	// verificationWorker builds a checklist bases_to_check[MAX_BASE] and fills it
+	// for bases 2..max_fast_check (bounded by max_target_base). Without this guard, a
+	// max_target_base >= MAX_BASE silently overflows that stack array
+	if (max_target_base < 2 || max_target_base >= MAX_BASE)
+	{
+		fprintf(stderr, "Error: maxbase must be in range [2, %u). Got %u.\n", MAX_BASE, max_target_base);
+		exit(EXIT_FAILURE);
+	}
+
 	uint32_t largestds = 65 * (max_target_base - 1);
 	uint32_t sp_bytes = largestds + 1;
 	if (sp_bytes < 155)
@@ -1181,56 +1204,57 @@ int main(int argc, char **argv)
 	// 16 byte align
 	sp_bytes = (sp_bytes + 15) & ~15;
 
+	// Compute the small primes array
 	global_smallprimes = (uint8_t *)calloc(sp_bytes, sizeof(uint8_t));
 	for (uint32_t i = 0; i <= largestds; i++)
 		global_smallprimes[i] = cpu_isPrime(i) ? 1 : 0;
 
-	// The widened Base 3 and Base 5 CPU generation
+	// Compute the digit sum arrays for each non-power-of-2 base
 	uint8_t h_base3[base3Size];
-	for (int i = 0; i < base3Size; i++)
+	for (uint32_t i = 0; i < base3Size; i++)
 		h_base3[i] = sumDigits(i, 3);
 
 	uint8_t h_base5[base5Size];
-	for (int i = 0; i < base5Size; i++)
+	for (uint32_t i = 0; i < base5Size; i++)
 		h_base5[i] = sumDigits(i, 5);
 
 	uint8_t h_base6[base6Size];
-	for (int i = 0; i < base6Size; i++)
+	for (uint32_t i = 0; i < base6Size; i++)
 		h_base6[i] = sumDigits(i, 6);
 
 	uint8_t h_base7[base7Size];
-	for (int i = 0; i < base7Size; i++)
+	for (uint32_t i = 0; i < base7Size; i++)
 		h_base7[i] = sumDigits(i, 7);
 
 	uint8_t h_base9[base9Size];
-	for (int i = 0; i < base9Size; i++)
+	for (uint32_t i = 0; i < base9Size; i++)
 		h_base9[i] = sumDigits(i, 9);
 
 	uint8_t h_base10[base10Size];
-	for (int i = 0; i < base10Size; i++)
+	for (uint32_t i = 0; i < base10Size; i++)
 		h_base10[i] = sumDigits(i, 10);
 
 	uint8_t h_base11[base11Size];
-	for (int i = 0; i < base11Size; i++)
+	for (uint32_t i = 0; i < base11Size; i++)
 		h_base11[i] = sumDigits(i, 11);
 
 	uint8_t h_base12[base12Size];
-	for (int i = 0; i < base12Size; i++)
+	for (uint32_t i = 0; i < base12Size; i++)
 		h_base12[i] = sumDigits(i, 12);
 
 	uint8_t h_base13[base13Size];
-	for (int i = 0; i < base13Size; i++)
+	for (uint32_t i = 0; i < base13Size; i++)
 		h_base13[i] = sumDigits(i, 13);
 
 	uint8_t h_base14[base14Size];
-	for (int i = 0; i < base14Size; i++)
+	for (uint32_t i = 0; i < base14Size; i++)
 		h_base14[i] = sumDigits(i, 14);
 
 	uint8_t h_base15[base15Size];
-	for (int i = 0; i < base15Size; i++)
+	for (uint32_t i = 0; i < base15Size; i++)
 		h_base15[i] = sumDigits(i, 15);
 
-	// Setup Wheel 30030 and masks in Constant Memory ---
+	// Setup mod-30030 wheel in Constant Memory
 	uint16_t h_wheel_30030[5760];
 	int w_idx = 0;
 	for (int i = 1; i < 30030; i++)
@@ -1242,17 +1266,11 @@ int main(int argc, char **argv)
 	}
 	CUDA_CHECK(cudaMemcpyToSymbol(c_wheel_30030, h_wheel_30030, sizeof(h_wheel_30030)));
 
-	uint32_t h_lane_mask[32];
-	for (int i = 0; i < 32; i++)
-	{
-		h_lane_mask[i] = (1u << i) - 1;
-	}
-	CUDA_CHECK(cudaMemcpyToSymbol(c_lane_mask, h_lane_mask, sizeof(h_lane_mask)));
-
+	// Allocate the small primes array and digit sum arrays on the device
 	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12, *d_b13, *d_b14, *d_b15;
 	CUDA_CHECK(cudaMalloc((void **)&d_sp, sp_bytes));
-	CUDA_CHECK(cudaMalloc((void **)&d_b3, base3Size16)); // Expanded allocation
-	CUDA_CHECK(cudaMalloc((void **)&d_b5, base5Size16)); // Expanded allocation
+	CUDA_CHECK(cudaMalloc((void **)&d_b3, base3Size16));
+	CUDA_CHECK(cudaMalloc((void **)&d_b5, base5Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b6, base6Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b7, base7Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b9, base9Size16));
@@ -1263,6 +1281,7 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaMalloc((void **)&d_b14, base14Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b15, base15Size16));
 
+	// Copy the small primes array and digit sum arrays from the host to the device
 	CUDA_CHECK(cudaMemcpy(d_sp, global_smallprimes, sp_bytes, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_b3, h_base3, base3Size, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_b5, h_base5, base5Size, cudaMemcpyHostToDevice));
@@ -1276,6 +1295,7 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaMemcpy(d_b14, h_base14, base14Size, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_b15, h_base15, base15Size, cudaMemcpyHostToDevice));
 
+	// Allocate the results arrays an counts for the double buffered streams (A and B)
 	uint64_t *d_results_A, *d_results_B;
 	uint32_t *d_count_A, *d_count_B;
 	CUDA_CHECK(cudaMalloc((void **)&d_results_A, MAX_GPU_RESULTS * sizeof(uint64_t)));
@@ -1291,6 +1311,7 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaStreamCreate(&stream_A));
 	CUDA_CHECK(cudaStreamCreate(&stream_B));
 
+	// Create the transfer stream
 	cudaStream_t stream_transfer;
 	CUDA_CHECK(cudaStreamCreate(&stream_transfer));
 
@@ -1310,7 +1331,7 @@ int main(int argc, char **argv)
 
 	// Perfect Grid Divisibility (Wheel 30030)
 	// To use Wheel 30030 efficiently, we map exactly 1 physical thread to 1 logical wheel offset.
-	// This means (gridSize * 768) MUST be perfectly divisible by 5760.
+	// This means (gridSize * 768) MUST be perfectly divisible by number of Cuda cores
 	// 5760 / 768 = 7.5. Therefore, gridSize must be a multiple of 15.
 	// E.g., for an RTX 4070 (46 SMs), original grid is 1472. (1472 / 15) * 15 = 1470 blocks.
 	gridSize = (gridSize / 15) * 15;
@@ -1319,7 +1340,7 @@ int main(int argc, char **argv)
 	// stride = exactly how many full wheels the grid processes per inner loop iteration
 	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / 5760ULL) * 30030ULL;
 
-	// get the GPU name
+	// Get the GPU name
 	int deviceId;
 	CUDA_CHECK(cudaGetDevice(&deviceId));
 	cudaDeviceProp prop;
@@ -1331,6 +1352,7 @@ int main(int argc, char **argv)
 	printf(" Campaign Scope Targets: Bases %u to %u\n", global_minbase.load(), max_target_base);
 	printf("====================================================\n");
 
+	// Output the trivial entries which are ds(1) through ds(7)
 	if (global_minbase.load() <= 2 && 2 <= max_target_base)
 	{
 		logRecord(1, 3);
@@ -1369,6 +1391,7 @@ int main(int argc, char **argv)
 	if (global_minbase.load() > max_target_base)
 		global_target_achieved.store(true);
 
+	// Create the CPU verification worker thread
 	std::thread worker(verificationWorker, end_block, subblock_size, max_target_base);
 
 	auto t_start = std::chrono::high_resolution_clock::now();
@@ -1380,11 +1403,17 @@ int main(int argc, char **argv)
 	uint64_t dispatched_block_id_A = 0, dispatched_block_id_B = 0;
 	uint32_t dispatched_minbase_A = 0, dispatched_minbase_B = 0;
 
-	// bases 12, 6 and 10 fit in shared memory
+	// The small primes array and digit sum arrays for bases 12, 6 and 10 fit in shared memory
 	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
 
+	// Main loop: launch the next block of candidate numbers to the GPU kernel
+	// Two compute streams are used (A and B) so the results from the last stream can be
+	// asynchronously fetched while the new block is running
 	while (current_block < end_block && !global_target_achieved.load())
 	{
+		// Dynamically size the batch depending on the current base since
+		// smaller bases have much larger result sets and we have a
+		// fixed-size results buffer
 		uint32_t active_minbase = global_minbase.load();
 
 		uint64_t dynamic_batch;
@@ -1410,6 +1439,7 @@ int main(int argc, char **argv)
 
 		uint64_t total_numbers_in_launch = dispatch_blocks * subblock_size + (raw_start_range - range_start);
 
+		// Templated Cuda kernel launch so the kernel only contains the checks needed for the current base
 		auto launch_search = [&](cudaStream_t stream, uint64_t start, uint64_t total, uint64_t *results, uint32_t *count, uint32_t mb)
 		{
 			if (mb >= 32)
@@ -1452,8 +1482,13 @@ int main(int argc, char **argv)
 			}
 		};
 
+		// Ping-pong across A and B
 		if (buffer_A_active)
 		{
+			// Tracks the D2H drain of d_results_A on stream_transfer, if one is issued below.
+			// stream_A must wait on this before its relaunch writes into d_results_A again.
+			cudaEvent_t drain_event_A = nullptr;
+
 			if (stream_A_inflight)
 			{
 				CUDA_CHECK(cudaStreamSynchronize(stream_A));
@@ -1472,6 +1507,7 @@ int main(int argc, char **argv)
 
 					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_A, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
 					CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
+					drain_event_A = bundle.ready_event;
 
 					{
 						std::lock_guard<std::mutex> lock(queue_mutex);
@@ -1480,6 +1516,14 @@ int main(int argc, char **argv)
 					queue_cv.notify_one();
 				}
 			}
+
+			// d_results_A is shared between stream_transfer (reading it out above) and
+			// stream_A (about to write fresh candidates into it below). These are
+			// independent streams with no implicit ordering, so without this wait the
+			// relaunch could start overwriting d_results_A before the copy engine has
+			// finished draining it -- a silent data race, not a crash.
+			if (drain_event_A != nullptr)
+				CUDA_CHECK(cudaStreamWaitEvent(stream_A, drain_event_A, 0));
 
 			CUDA_CHECK(cudaMemsetAsync(d_count_A, 0, sizeof(uint32_t), stream_A));
 			launch_search(stream_A, range_start, total_numbers_in_launch, d_results_A, d_count_A, active_minbase);
@@ -1493,6 +1537,10 @@ int main(int argc, char **argv)
 		}
 		else
 		{
+			// Tracks the D2H drain of d_results_B on stream_transfer, if one is issued below.
+			// stream_B must wait on this before its relaunch writes into d_results_B again.
+			cudaEvent_t drain_event_B = nullptr;
+
 			if (stream_B_inflight)
 			{
 				CUDA_CHECK(cudaStreamSynchronize(stream_B));
@@ -1511,6 +1559,8 @@ int main(int argc, char **argv)
 
 					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_B, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
 					CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
+					drain_event_B = bundle.ready_event;
+
 					{
 						std::lock_guard<std::mutex> lock(queue_mutex);
 						verification_queue.push({bundle, fetch_count, start_range_B, dispatched_block_id_B, dispatched_minbase_B});
@@ -1518,6 +1568,10 @@ int main(int argc, char **argv)
 					queue_cv.notify_one();
 				}
 			}
+
+			// Same race as above, mirrored for the B buffer/stream pair.
+			if (drain_event_B != nullptr)
+				CUDA_CHECK(cudaStreamWaitEvent(stream_B, drain_event_B, 0));
 
 			CUDA_CHECK(cudaMemsetAsync(d_count_B, 0, sizeof(uint32_t), stream_B));
 			launch_search(stream_B, range_start, total_numbers_in_launch, d_results_B, d_count_B, active_minbase);
@@ -1532,7 +1586,7 @@ int main(int argc, char **argv)
 		current_block += dispatch_blocks;
 	}
 
-	// --- CHRONOLOGICAL TEARDOWN ---
+	// Finished so tear down the streams
 	auto push_A = [&]()
 	{
 		if (stream_A_inflight)
@@ -1612,16 +1666,19 @@ int main(int argc, char **argv)
 	double total_time = diff.count();
 	uint64_t total_numbers_checked = (current_block - start_block) * subblock_size;
 
+	// Output the throughput attained
 	printf("\n===================================================\n");
 	printf(" Execution Terminated Successfully.\n");
 	printf(" Elapsed Time: %.2f seconds\n", total_time);
 	printf(" Effective Throughput: %.2f Billion numbers/sec\n", (total_numbers_checked / total_time) / 1e9);
 	printf("===================================================\n");
 
+	// Destroy the streams
 	CUDA_CHECK(cudaStreamDestroy(stream_A));
 	CUDA_CHECK(cudaStreamDestroy(stream_B));
 	CUDA_CHECK(cudaStreamDestroy(stream_transfer));
 
+	// Free memory
 	CUDA_CHECK(cudaFree(d_sp));
 	CUDA_CHECK(cudaFree(d_b3));
 	CUDA_CHECK(cudaFree(d_b5));
@@ -1645,6 +1702,17 @@ int main(int argc, char **argv)
 	{
 		CUDA_CHECK(cudaFreeHost(h_buffer_pool[i]));
 	}
+
+	// Drain the buffer pool and destroy the events created alongside each buffer.
+	// By this point every bundle is guaranteed to be back in free_buffers: the
+	// worker thread has joined, and the push_A()/push_B() calls above already
+	// returned any in-flight bundles before engine_running was cleared.
+	while (!free_buffers.empty())
+	{
+		CUDA_CHECK(cudaEventDestroy(free_buffers.front().ready_event));
+		free_buffers.pop();
+	}
+
 	free(global_smallprimes);
 
 	return 0;
