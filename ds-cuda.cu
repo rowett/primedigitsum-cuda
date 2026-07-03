@@ -701,11 +701,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				r = rq;
 				sum += __ldg(&b14[r]);
 
+				// v_low only needs two chunks
 				r = v_low;
-				rq = r / 38416U;
-				sum += __ldg(&b14[r - rq * 38416U]);
-
-				r = rq;
 				rq = r / 38416U;
 				sum += __ldg(&b14[r - rq * 38416U]);
 
@@ -900,11 +897,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				r = rq;
 				sum += __ldg(&b13[r]);
 
+				// v_low only needs two chunks
 				r = v_low;
-				rq = r / 28561U;
-				sum += __ldg(&b13[r - rq * 28561U]);
-
-				r = rq;
 				rq = r / 28561U;
 				sum += __ldg(&b13[r - rq * 28561U]);
 
@@ -937,11 +931,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				r = rq;
 				sum += __ldg(&b15[r]);
 
+				// v_low only needs two chunks
 				r = v_low;
-				rq = r / 50625U;
-				sum += __ldg(&b15[r - rq * 50625U]);
-
-				r = rq;
 				rq = r / 50625U;
 				sum += __ldg(&b15[r - rq * 50625U]);
 
