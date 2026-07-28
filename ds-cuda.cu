@@ -4,8 +4,8 @@
 // This program searches for ds(n) numbers.
 //
 // The GPU is used identify candidate numbers by:
-// 1. Using a mod-30030 prime wheel to reject any number that is a
-//    multiple of 2, 3, 5, 7, 11, or 13 (this rejects 80.82% of candidates)
+// 1. Using a mod-510510 prime wheel to reject any number that is a
+//    multiple of 2, 3, 5, 7, 11, 13, or 17 (this rejects 81.95% of candidates)
 // 2. Checking if the digit sums are prime in the following
 //    bases in this order: (powers of two) 2, 4, 16, 8, 32,
 //                         (even bases)    12, 6, 10, 14,
@@ -56,6 +56,13 @@ std::string formatCommas(uint64_t num)
 	}
 	return s;
 }
+
+// Prime wheel geometry.
+// WHEEL_MOD   = 2*3*5*7*11*13*17
+// WHEEL_COUNT = phi(WHEEL_MOD) = 1*2*4*6*10*12*16, i.e. the residues coprime
+//               to all seven primes. 92160/510510 = 18.05% survive the wheel
+#define WHEEL_MOD 510510ULL
+#define WHEEL_COUNT 92160U
 
 // Block size on the GPU
 // Kept at 768 for optimal 2-block SM occupancy and register mapping
@@ -424,8 +431,13 @@ void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t s
 	}
 }
 
-// Prime wheel 30030 offsets
-__constant__ uint16_t c_wheel_30030[5760]; // 5760 offsets coprime to 2, 3, 5, 7, 11, and 13 (Takes 11.5 KB)
+// Prime wheel 510510 offsets.
+// Offsets now reach 510509, so they need uint32 and the table is 360 KB --
+// far past the 64 KB constant bank, so it lives in global memory instead.
+// This costs nothing in the loop: each thread reads exactly one offset before
+// the walk begins, and consecutive lanes read consecutive entries, so a warp
+// takes a single coalesced 128-byte transaction per launch.
+__device__ uint32_t d_wheel_510510[WHEEL_COUNT];
 
 // This is the GPU kernel that filters candidate numbers
 // It's templated on minimum base to remove rendundant base checks at lower bases
@@ -496,472 +508,515 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	const uint8_t *__restrict__ const local_b6 = s_b6;
 	const uint8_t *__restrict__ const local_b10 = s_b10;
 
-	// Calculate global thread mapping for Wheel 30030
+	// Calculate global thread mapping for Wheel 510510
 	const uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
 	// Constant division will be replaced by the compiler for speed
-	const uint32_t wheel_idx = global_id % 5760ULL;
-	const uint64_t cycle = global_id / 5760ULL;
+	const uint32_t wheel_idx = global_id % (uint64_t)WHEEL_COUNT;
+	const uint64_t cycle = global_id / (uint64_t)WHEEL_COUNT;
 
-	// Initial candidate via the Constant Cache broadcast
-	uint64_t candidate = start_range + (cycle * 30030ULL) + c_wheel_30030[wheel_idx];
+	// Initial candidate; one coalesced load per warp, hoisted out of the walk
+	uint64_t candidate = start_range + (cycle * WHEEL_MOD) + __ldg(&d_wheel_510510[wheel_idx]);
 
 	// Wait for the tables to finish copying
 	__pipeline_commit();
 	__pipeline_wait_prior(0);
 	__syncthreads();
 
-	// Test each candidate
+	// ---------------------------------------------------------------------
+	// OUTER LOOP: pins the top 32 bits of the candidate.
+	// Runs once per 2^32 of range covered, i.e. roughly once per 730 inner
+	// iterations at the standard stride.
+	// ---------------------------------------------------------------------
 	while (candidate < end_range)
 	{
-		bool pass = false;
+		const uint32_t hi = (uint32_t)(candidate >> 32);
 
-		// Check digit sum primality
-		// Base order is optimal for filter strength and check cost
-		do
+		// Partial digit sums contributed by bits 32..63. Loop-invariant for
+		// the whole inner loop. Each mask below is the top half of the
+		// corresponding 64-bit mask in the original kernel.
+
+		// Base 2: popcount of the high word
+		const uint32_t DS2_HI = __popc(hi);
+
+		// Base 4: ds4 = ds2 + (count of set bits in odd positions)
+		const uint32_t DS4_HI = DS2_HI + __popc(hi & 0xAAAAAAAAu);
+
+		// Base 8: ds8 = ds2 + P1 + 3*P2, Pj = set bits at positions == j (mod 3)
+		const uint32_t DS8_HI = DS2_HI + __popc(hi & 0x24924924u) + 3u * __popc(hi & 0x49249249u);
+
+		// Base 16: nibble fold, then horizontal byte sum
+		uint32_t DS16_HI = 0u;
+		if constexpr (MIN_BASE >= 16)
 		{
-			// Power of 2 bases have very low cost
-			// Base 2
-			const uint32_t p = __popcll(candidate);
-
-			// Base 4
-			const uint32_t ds4 = p + __popcll(candidate & 0xAAAAAAAAAAAAAAAAULL);
-
-			// Check base 2 and base 4 simultaneously (good for ILP)
-			if (!(local_sp[p] & local_sp[ds4]))
-				break;
-
-			// Base 16
-			if constexpr (MIN_BASE >= 16)
-			{
-				const uint32_t c_low = (uint32_t)candidate;
-				const uint32_t c_high = (uint32_t)(candidate >> 32);
-
-				const uint32_t n_low = (c_low & 0x0F0F0F0F) + ((c_low >> 4) & 0x0F0F0F0F);
-				const uint32_t n_high = (c_high & 0x0F0F0F0F) + ((c_high >> 4) & 0x0F0F0F0F);
-
-				// Sum the 8 bytes across two single-cycle instructions
-				const uint32_t ds16 = __dp4a(n_high, 0x01010101U, __dp4a(n_low, 0x01010101U, 0U));
-
-				if (!local_sp[ds16])
-					break;
-			}
-
-			// Base 8
-			const uint32_t b1 = __popcll(candidate & 0x2492492492492492ULL);
-			const uint32_t b2 = __popcll(candidate & 0x4924924924924924ULL);
-			const uint32_t ds8 = p + b1 + b2 * 3;
-
-			if (!local_sp[ds8])
-				break;
-
-			// Base 32
-			if constexpr (MIN_BASE >= 32)
-			{
-				const uint32_t b1 = __popcll(candidate & 0x2108421084210842ULL);
-				const uint32_t b2 = __popcll(candidate & 0x4210842108421084ULL);
-				const uint32_t b3 = __popcll(candidate & 0x8421084210842108ULL);
-				const uint32_t b4 = __popcll(candidate & 0x0842108421084210ULL);
-				const uint32_t ds32 = p + b1 + b2 * 3 + b3 * 7 + b4 * 15;
-
-				if (!local_sp[ds32])
-					break;
-			}
-
-			// Remaining even bases are stronger filters than odd bases
-			// Each filter from here uses division by constants which are replaced by the compiler
-			// and narrow to 32 bit as soon as possible
-
-			// NOTE on gating: bases 2, 4, 8, 3, 6, 5, 9, 7 are checked
-			// UNCONDITIONALLY regardless of MIN_BASE (they're cheap and always in
-			// scope). Bases 16, 32, 12, 10, 14, 11, 13, 15 are gated by
-			// `if constexpr (MIN_BASE >= N)` and compiled out entirely for kernel
-			// instantiations targeting a lower MIN_BASE.
-
-			// --- Base 12 ---
-			if constexpr (MIN_BASE >= 12)
-			{
-				const uint64_t v_hi = candidate / 429981696ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 429981696ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 20736ULL;
-				sum += local_b12[r64 - rq64 * 20736ULL];
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 20736U;
-				sum += local_b12[r - rq * 20736U];
-
-				r = rq;
-				sum += local_b12[r];
-
-				r = v_low;
-				rq = r / 20736U;
-				sum += local_b12[r - rq * 20736U];
-
-				r = rq;
-				sum += local_b12[r];
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 6 ---
-			{
-				const uint64_t v_hi = candidate / 2176782336ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 2176782336ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 1296ULL;
-				sum += local_b6[r64 - rq64 * 1296ULL];
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 1296U;
-				sum += local_b6[r - rq * 1296U];
-
-				r = rq;
-				rq = r / 1296U;
-				sum += local_b6[r - rq * 1296U];
-
-				r = rq;
-				sum += local_b6[r];
-
-				r = v_low;
-				rq = r / 1296U;
-				sum += local_b6[r - rq * 1296U];
-
-				r = rq;
-				rq = r / 1296U;
-				sum += local_b6[r - rq * 1296U];
-
-				r = rq;
-				sum += local_b6[r];
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 10 ---
-			if constexpr (MIN_BASE >= 10)
-			{
-				const uint64_t v_hi = candidate / 1000000000ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 1000000000ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 10000ULL;
-				sum += local_b10[r64 - rq64 * 10000ULL];
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 10000U;
-				sum += local_b10[r - rq * 10000U];
-
-				r = rq;
-				sum += local_b10[r];
-
-				r = v_low;
-				rq = r / 10000U;
-				sum += local_b10[r - rq * 10000U];
-
-				r = rq;
-				rq = r / 10000U;
-				sum += local_b10[r - rq * 10000U];
-
-				r = rq;
-				sum += local_b10[r];
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 14 ---
-			if constexpr (MIN_BASE >= 14)
-			{
-				// 14^8 = 1,475,789,056
-				const uint64_t v_hi = candidate / 1475789056ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 1475789056ULL);
-
-				uint32_t sum = 0;
-
-				// Chunking factor 14^4 = 38416
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 38416ULL;
-				sum += __ldg(&b14[r64 - rq64 * 38416ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 38416U;
-				sum += __ldg(&b14[r - rq * 38416U]);
-
-				r = rq;
-				sum += __ldg(&b14[r]);
-
-				// v_low only needs two chunks
-				r = v_low;
-				rq = r / 38416U;
-				sum += __ldg(&b14[r - rq * 38416U]);
-
-				r = rq;
-				sum += __ldg(&b14[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 5 ---
-			{
-				const uint64_t v_hi = candidate / 244140625ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 244140625ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 15625ULL;
-				sum += __ldg(&b5[r64 - rq64 * 15625ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 15625U;
-				sum += __ldg(&b5[r - rq * 15625U]);
-
-				r = rq;
-				sum += __ldg(&b5[r]);
-
-				r = v_low;
-				rq = r / 15625U;
-				sum += __ldg(&b5[r - rq * 15625U]);
-
-				r = rq;
-				sum += __ldg(&b5[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 9 ---
-			{
-				const uint64_t v_hi = candidate / 3486784401ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 3486784401ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 6561ULL;
-				sum += __ldg(&b9[r64 - rq64 * 6561ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 6561U;
-				sum += __ldg(&b9[r - rq * 6561U]);
-
-				r = rq;
-				sum += __ldg(&b9[r]);
-
-				r = v_low;
-				rq = r / 6561U;
-				sum += __ldg(&b9[r - rq * 6561U]);
-
-				r = rq;
-				rq = r / 6561U;
-				sum += __ldg(&b9[r - rq * 6561U]);
-
-				r = rq;
-				sum += __ldg(&b9[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 3 ---
-			{
-				const uint64_t v_hi = candidate / 43046721ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 43046721ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 6561ULL;
-				sum += __ldg(&b3[r64 - rq64 * 6561ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 6561U;
-				sum += __ldg(&b3[r - rq * 6561U]);
-
-				r = rq;
-				rq = r / 6561U;
-				sum += __ldg(&b3[r - rq * 6561U]);
-
-				r = rq;
-				sum += __ldg(&b3[r]);
-
-				r = v_low;
-				rq = r / 6561U;
-				sum += __ldg(&b3[r - rq * 6561U]);
-
-				r = rq;
-				sum += __ldg(&b3[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 11 ---
-			if constexpr (MIN_BASE >= 11)
-			{
-				const uint64_t v_hi = candidate / 2357947691ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 2357947691ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 14641ULL;
-				sum += __ldg(&b11[r64 - rq64 * 14641ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 14641U;
-				sum += __ldg(&b11[r - rq * 14641U]);
-
-				r = rq;
-				sum += __ldg(&b11[r]);
-
-				r = v_low;
-				rq = r / 14641U;
-				sum += __ldg(&b11[r - rq * 14641U]);
-
-				r = rq;
-				rq = r / 14641U;
-				sum += __ldg(&b11[r - rq * 14641U]);
-
-				r = rq;
-				sum += __ldg(&b11[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 7 ---
-			{
-				const uint64_t v_hi = candidate / 1977326743ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 1977326743ULL);
-
-				uint32_t sum = 0;
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 2401ULL;
-				sum += __ldg(&b7[r64 - rq64 * 2401ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 2401U;
-				sum += __ldg(&b7[r - rq * 2401U]);
-
-				r = rq;
-				sum += __ldg(&b7[r]);
-
-				r = v_low;
-				rq = r / 2401U;
-				sum += __ldg(&b7[r - rq * 2401U]);
-
-				r = rq;
-				rq = r / 2401U;
-				sum += __ldg(&b7[r - rq * 2401U]);
-
-				r = rq;
-				sum += __ldg(&b7[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 13 ---
-			if constexpr (MIN_BASE >= 13)
-			{
-				// 13^8 = 815,730,721
-				const uint64_t v_hi = candidate / 815730721ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 815730721ULL);
-
-				uint32_t sum = 0;
-
-				// Chunking factor 13^4 = 28561
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 28561ULL;
-				sum += __ldg(&b13[r64 - rq64 * 28561ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 28561U;
-				sum += __ldg(&b13[r - rq * 28561U]);
-
-				r = rq;
-				sum += __ldg(&b13[r]);
-
-				// v_low only needs two chunks
-				r = v_low;
-				rq = r / 28561U;
-				sum += __ldg(&b13[r - rq * 28561U]);
-
-				r = rq;
-				sum += __ldg(&b13[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// --- Base 15 ---
-			if constexpr (MIN_BASE >= 15)
-			{
-				// 15^8 = 2,562,890,625
-				const uint64_t v_hi = candidate / 2562890625ULL;
-				const uint32_t v_low = (uint32_t)(candidate - v_hi * 2562890625ULL);
-
-				uint32_t sum = 0;
-
-				// Chunking factor 15^4 = 50625
-				uint64_t r64 = v_hi;
-				uint64_t rq64 = r64 / 50625ULL;
-				sum += __ldg(&b15[r64 - rq64 * 50625ULL]);
-
-				r64 = rq64;
-				uint32_t r = (uint32_t)r64;
-				uint32_t rq = r / 50625U;
-				sum += __ldg(&b15[r - rq * 50625U]);
-
-				r = rq;
-				sum += __ldg(&b15[r]);
-
-				// v_low only needs two chunks
-				r = v_low;
-				rq = r / 50625U;
-				sum += __ldg(&b15[r - rq * 50625U]);
-
-				r = rq;
-				sum += __ldg(&b15[r]);
-
-				if (!local_sp[sum])
-					break;
-			}
-
-			// If we successfully run the gauntlet without breaking
-			pass = true;
-		} while (0);
-
-		// Check if the guantlet was passed
-		// (no point using __ballot_sync() since chance of multiple threads passing is tiny)
-		if (pass)
-		{
-			// Add candidate to the result list
-			uint32_t idx = atomicAdd(d_count, 1);
-
-			// Ensure result buffer doesn't overflow
-			if (idx < MAX_GPU_RESULTS)
-			{
-				d_results[idx] = candidate;
-			}
+			const uint32_t n_high = (hi & 0x0F0F0F0F) + ((hi >> 4) & 0x0F0F0F0F);
+			DS16_HI = __dp4a(n_high, 0x01010101U, 0U);
 		}
 
-		candidate += stride;
+		// Base 32: ds32 = ds2 + P1 + 3*P2 + 7*P3 + 15*P4, Pj mod 5
+		uint32_t DS32_HI = 0u;
+		if constexpr (MIN_BASE >= 32)
+		{
+			DS32_HI = DS2_HI + __popc(hi & 0x21084210u) + 3u * __popc(hi & 0x42108421u) + 7u * __popc(hi & 0x84210842u) + 15u * __popc(hi & 0x08421084u);
+		}
+
+		// Upper bound of this high-word window, clamped to the launch range.
+		// The == 0 test catches the hi == 0xFFFFFFFF wrap.
+		uint64_t hi_limit = ((uint64_t)hi + 1ULL) << 32;
+		if (hi_limit == 0ULL || hi_limit > end_range)
+			hi_limit = end_range;
+
+		// -----------------------------------------------------------------
+		// INNER LOOP: only the low 32 bits vary.
+		// -----------------------------------------------------------------
+		while (candidate < hi_limit)
+		{
+			const uint32_t lo = (uint32_t)candidate;
+			const uint32_t pc_lo = __popc(lo);
+
+			bool pass = false;
+
+			// Check digit sum primality
+			// Base order is optimal for filter strength and check cost
+			do
+			{
+				// Power of 2 bases have very low cost
+				// Base 2
+				const uint32_t p = DS2_HI + pc_lo;
+
+				// Base 4
+				const uint32_t ds4 = DS4_HI + pc_lo + __popc(lo & 0xAAAAAAAAu);
+
+				// Check base 2 and base 4 simultaneously (good for ILP)
+				if (!(local_sp[p] & local_sp[ds4]))
+					break;
+
+				// Base 16
+				if constexpr (MIN_BASE >= 16)
+				{
+					const uint32_t n_low = (lo & 0x0F0F0F0F) + ((lo >> 4) & 0x0F0F0F0F);
+
+					// Accumulate straight onto the cached high-word byte sum
+					const uint32_t ds16 = __dp4a(n_low, 0x01010101U, DS16_HI);
+
+					if (!local_sp[ds16])
+						break;
+				}
+
+				// Base 8
+				const uint32_t ds8 = DS8_HI + pc_lo + __popc(lo & 0x92492492u) + 3u * __popc(lo & 0x24924924u);
+
+				if (!local_sp[ds8])
+					break;
+
+				// Base 32
+				if constexpr (MIN_BASE >= 32)
+				{
+					const uint32_t ds32 = DS32_HI + pc_lo + __popc(lo & 0x84210842u) + 3u * __popc(lo & 0x08421084u) + 7u * __popc(lo & 0x10842108u) + 15u * __popc(lo & 0x21084210u);
+
+					if (!local_sp[ds32])
+						break;
+				}
+
+				// Remaining even bases are stronger filters than odd bases
+				// Each filter from here uses division by constants which are replaced by the compiler
+				// and narrow to 32 bit as soon as possible
+				//
+				// These operate on the full 64-bit candidate and are unchanged.
+				// A warp only reaches this point when at least one of its lanes
+				// survived every power-of-two filter, so they are off the hot path.
+
+				// NOTE on gating: bases 2, 4, 8, 3, 6, 5, 9, 7 are checked
+				// UNCONDITIONALLY regardless of MIN_BASE (they're cheap and always in
+				// scope). Bases 16, 32, 12, 10, 14, 11, 13, 15 are gated by
+				// `if constexpr (MIN_BASE >= N)` and compiled out entirely for kernel
+				// instantiations targeting a lower MIN_BASE.
+
+				// --- Base 12 ---
+				if constexpr (MIN_BASE >= 12)
+				{
+					const uint64_t v_hi = candidate / 429981696ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 429981696ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 20736ULL;
+					sum += local_b12[r64 - rq64 * 20736ULL];
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 20736U;
+					sum += local_b12[r - rq * 20736U];
+
+					r = rq;
+					sum += local_b12[r];
+
+					r = v_low;
+					rq = r / 20736U;
+					sum += local_b12[r - rq * 20736U];
+
+					r = rq;
+					sum += local_b12[r];
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 6 ---
+				{
+					const uint64_t v_hi = candidate / 2176782336ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 2176782336ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 1296ULL;
+					sum += local_b6[r64 - rq64 * 1296ULL];
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 1296U;
+					sum += local_b6[r - rq * 1296U];
+
+					r = rq;
+					rq = r / 1296U;
+					sum += local_b6[r - rq * 1296U];
+
+					r = rq;
+					sum += local_b6[r];
+
+					r = v_low;
+					rq = r / 1296U;
+					sum += local_b6[r - rq * 1296U];
+
+					r = rq;
+					rq = r / 1296U;
+					sum += local_b6[r - rq * 1296U];
+
+					r = rq;
+					sum += local_b6[r];
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 10 ---
+				if constexpr (MIN_BASE >= 10)
+				{
+					const uint64_t v_hi = candidate / 1000000000ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 1000000000ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 10000ULL;
+					sum += local_b10[r64 - rq64 * 10000ULL];
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 10000U;
+					sum += local_b10[r - rq * 10000U];
+
+					r = rq;
+					sum += local_b10[r];
+
+					r = v_low;
+					rq = r / 10000U;
+					sum += local_b10[r - rq * 10000U];
+
+					r = rq;
+					rq = r / 10000U;
+					sum += local_b10[r - rq * 10000U];
+
+					r = rq;
+					sum += local_b10[r];
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 14 ---
+				if constexpr (MIN_BASE >= 14)
+				{
+					// 14^8 = 1,475,789,056
+					const uint64_t v_hi = candidate / 1475789056ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 1475789056ULL);
+
+					uint32_t sum = 0;
+
+					// Chunking factor 14^4 = 38416
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 38416ULL;
+					sum += __ldg(&b14[r64 - rq64 * 38416ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 38416U;
+					sum += __ldg(&b14[r - rq * 38416U]);
+
+					r = rq;
+					sum += __ldg(&b14[r]);
+
+					// v_low only needs two chunks
+					r = v_low;
+					rq = r / 38416U;
+					sum += __ldg(&b14[r - rq * 38416U]);
+
+					r = rq;
+					sum += __ldg(&b14[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 5 ---
+				{
+					const uint64_t v_hi = candidate / 244140625ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 244140625ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 15625ULL;
+					sum += __ldg(&b5[r64 - rq64 * 15625ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 15625U;
+					sum += __ldg(&b5[r - rq * 15625U]);
+
+					r = rq;
+					sum += __ldg(&b5[r]);
+
+					r = v_low;
+					rq = r / 15625U;
+					sum += __ldg(&b5[r - rq * 15625U]);
+
+					r = rq;
+					sum += __ldg(&b5[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 9 ---
+				{
+					const uint64_t v_hi = candidate / 3486784401ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 3486784401ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 6561ULL;
+					sum += __ldg(&b9[r64 - rq64 * 6561ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 6561U;
+					sum += __ldg(&b9[r - rq * 6561U]);
+
+					r = rq;
+					sum += __ldg(&b9[r]);
+
+					r = v_low;
+					rq = r / 6561U;
+					sum += __ldg(&b9[r - rq * 6561U]);
+
+					r = rq;
+					rq = r / 6561U;
+					sum += __ldg(&b9[r - rq * 6561U]);
+
+					r = rq;
+					sum += __ldg(&b9[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 3 ---
+				{
+					const uint64_t v_hi = candidate / 43046721ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 43046721ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 6561ULL;
+					sum += __ldg(&b3[r64 - rq64 * 6561ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 6561U;
+					sum += __ldg(&b3[r - rq * 6561U]);
+
+					r = rq;
+					rq = r / 6561U;
+					sum += __ldg(&b3[r - rq * 6561U]);
+
+					r = rq;
+					sum += __ldg(&b3[r]);
+
+					r = v_low;
+					rq = r / 6561U;
+					sum += __ldg(&b3[r - rq * 6561U]);
+
+					r = rq;
+					sum += __ldg(&b3[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 11 ---
+				if constexpr (MIN_BASE >= 11)
+				{
+					const uint64_t v_hi = candidate / 2357947691ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 2357947691ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 14641ULL;
+					sum += __ldg(&b11[r64 - rq64 * 14641ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 14641U;
+					sum += __ldg(&b11[r - rq * 14641U]);
+
+					r = rq;
+					sum += __ldg(&b11[r]);
+
+					r = v_low;
+					rq = r / 14641U;
+					sum += __ldg(&b11[r - rq * 14641U]);
+
+					r = rq;
+					rq = r / 14641U;
+					sum += __ldg(&b11[r - rq * 14641U]);
+
+					r = rq;
+					sum += __ldg(&b11[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 7 ---
+				{
+					const uint64_t v_hi = candidate / 1977326743ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 1977326743ULL);
+
+					uint32_t sum = 0;
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 2401ULL;
+					sum += __ldg(&b7[r64 - rq64 * 2401ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 2401U;
+					sum += __ldg(&b7[r - rq * 2401U]);
+
+					r = rq;
+					sum += __ldg(&b7[r]);
+
+					r = v_low;
+					rq = r / 2401U;
+					sum += __ldg(&b7[r - rq * 2401U]);
+
+					r = rq;
+					rq = r / 2401U;
+					sum += __ldg(&b7[r - rq * 2401U]);
+
+					r = rq;
+					sum += __ldg(&b7[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 13 ---
+				if constexpr (MIN_BASE >= 13)
+				{
+					// 13^8 = 815,730,721
+					const uint64_t v_hi = candidate / 815730721ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 815730721ULL);
+
+					uint32_t sum = 0;
+
+					// Chunking factor 13^4 = 28561
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 28561ULL;
+					sum += __ldg(&b13[r64 - rq64 * 28561ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 28561U;
+					sum += __ldg(&b13[r - rq * 28561U]);
+
+					r = rq;
+					sum += __ldg(&b13[r]);
+
+					// v_low only needs two chunks
+					r = v_low;
+					rq = r / 28561U;
+					sum += __ldg(&b13[r - rq * 28561U]);
+
+					r = rq;
+					sum += __ldg(&b13[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// --- Base 15 ---
+				if constexpr (MIN_BASE >= 15)
+				{
+					// 15^8 = 2,562,890,625
+					const uint64_t v_hi = candidate / 2562890625ULL;
+					const uint32_t v_low = (uint32_t)(candidate - v_hi * 2562890625ULL);
+
+					uint32_t sum = 0;
+
+					// Chunking factor 15^4 = 50625
+					uint64_t r64 = v_hi;
+					uint64_t rq64 = r64 / 50625ULL;
+					sum += __ldg(&b15[r64 - rq64 * 50625ULL]);
+
+					r64 = rq64;
+					uint32_t r = (uint32_t)r64;
+					uint32_t rq = r / 50625U;
+					sum += __ldg(&b15[r - rq * 50625U]);
+
+					r = rq;
+					sum += __ldg(&b15[r]);
+
+					// v_low only needs two chunks
+					r = v_low;
+					rq = r / 50625U;
+					sum += __ldg(&b15[r - rq * 50625U]);
+
+					r = rq;
+					sum += __ldg(&b15[r]);
+
+					if (!local_sp[sum])
+						break;
+				}
+
+				// If we successfully run the gauntlet without breaking
+				pass = true;
+			} while (0);
+
+			// Check if the guantlet was passed
+			// (no point using __ballot_sync() since chance of multiple threads passing is tiny)
+			if (pass)
+			{
+				// Add candidate to the result list
+				uint32_t idx = atomicAdd(d_count, 1);
+
+				// Ensure result buffer doesn't overflow
+				if (idx < MAX_GPU_RESULTS)
+				{
+					d_results[idx] = candidate;
+				}
+			}
+
+			candidate += stride;
+		}
 	}
 }
 
@@ -1245,17 +1300,24 @@ int main(int argc, char **argv)
 	for (uint32_t i = 0; i < base15Size; i++)
 		h_base15[i] = sumDigits(i, 15);
 
-	// Setup mod-30030 wheel in Constant Memory
-	uint16_t h_wheel_30030[5760];
-	int w_idx = 0;
-	for (int i = 1; i < 30030; i++)
+	// Setup mod-510510 wheel in Global Memory
+	// 'static' keeps this 360 KB table out of the stack -- main() already holds
+	// roughly 190 KB of digit-sum tables and the default MSVC stack is 1 MB.
+	static uint32_t h_wheel_510510[WHEEL_COUNT];
+	uint32_t w_idx = 0;
+	for (uint32_t i = 1; i < (uint32_t)WHEEL_MOD; i++)
 	{
-		if (i % 2 != 0 && i % 3 != 0 && i % 5 != 0 && i % 7 != 0 && i % 11 != 0 && i % 13 != 0)
+		if (i % 2 != 0 && i % 3 != 0 && i % 5 != 0 && i % 7 != 0 && i % 11 != 0 && i % 13 != 0 && i % 17 != 0)
 		{
-			h_wheel_30030[w_idx++] = (uint16_t)i;
+			h_wheel_510510[w_idx++] = i;
 		}
 	}
-	CUDA_CHECK(cudaMemcpyToSymbol(c_wheel_30030, h_wheel_30030, sizeof(h_wheel_30030)));
+	if (w_idx != WHEEL_COUNT)
+	{
+		fprintf(stderr, "Wheel build failed: got %u offsets, expected %u\n", w_idx, WHEEL_COUNT);
+		return 1;
+	}
+	CUDA_CHECK(cudaMemcpyToSymbol(d_wheel_510510, h_wheel_510510, sizeof(h_wheel_510510)));
 
 	// Allocate the small primes array and digit sum arrays on the device
 	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12, *d_b13, *d_b14, *d_b15;
@@ -1315,21 +1377,42 @@ int main(int argc, char **argv)
 		free_buffers.push({h_buffer_pool[i], event});
 	}
 
+	// The small primes array and digit sum arrays for bases 12, 6 and 10 fit in shared memory
+	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
+
 	int numSMs;
 	CUDA_CHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0));
 	int blockSize = BLOCK_SIZE; // Fixed 768
 	int gridSize = numSMs * 32;
 
-	// Perfect Grid Divisibility (Wheel 30030)
-	// To use Wheel 30030 efficiently, we map exactly 1 physical thread to 1 logical wheel offset.
-	// This means (gridSize * 768) MUST be perfectly divisible by number of Cuda cores
-	// 5760 / 768 = 7.5. Therefore, gridSize must be a multiple of 15.
-	// E.g., for an RTX 4070 (46 SMs), original grid is 1472. (1472 / 15) * 15 = 1470 blocks.
-	gridSize = (gridSize / 15) * 15;
+	const int gridQuantum = (int)(WHEEL_COUNT / (uint32_t)blockSize);   // 120
+
+	// Query resident blocks per SM rather than trusting __launch_bounds__
+	int blocksPerSM = 0;
+	CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+	&blocksPerSM, unifiedSearchKernel<32>, blockSize, shared_mem_bytes));
+	if (blocksPerSM < 1)
+	blocksPerSM = 1;
+	const int wave = numSMs * blocksPerSM;
+
+	// Smallest multiple of the quantum that wastes least of the final wave
+	int bestGrid = gridQuantum;
+	int bestWaves = (gridQuantum + wave - 1) / wave;
+	for (int g = gridQuantum + gridQuantum; g <= wave * 32; g += gridQuantum)
+	{
+		const int waves = (g + wave - 1) / wave;
+		// g / waves > bestGrid / bestWaves, cross-multiplied
+		if ((long long)g * bestWaves > (long long)bestGrid * waves)
+		{
+			bestGrid = g;
+			bestWaves = waves;
+		}
+	}
+	gridSize = bestGrid;
 
 	// Calculate stride based on perfect alignment
 	// stride = exactly how many full wheels the grid processes per inner loop iteration
-	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / 5760ULL) * 30030ULL;
+	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / (uint64_t)WHEEL_COUNT) * WHEEL_MOD;
 
 	// Get the GPU name
 	int deviceId;
@@ -1394,9 +1477,6 @@ int main(int argc, char **argv)
 	uint64_t dispatched_block_id_A = 0, dispatched_block_id_B = 0;
 	uint32_t dispatched_minbase_A = 0, dispatched_minbase_B = 0;
 
-	// The small primes array and digit sum arrays for bases 12, 6 and 10 fit in shared memory
-	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
-
 	// Main loop: launch the next block of candidate numbers to the GPU kernel
 	// Two compute streams are used (A and B) so the results from the last stream can be
 	// asynchronously fetched while the new block is running
@@ -1425,8 +1505,8 @@ int main(int argc, char **argv)
 
 		uint64_t raw_start_range = current_block * subblock_size;
 
-		// Update bounds logic to explicitly align with the 30030 jump space
-		uint64_t range_start = (raw_start_range / 30030ULL) * 30030ULL;
+		// Update bounds logic to explicitly align with the 510510 jump space
+		uint64_t range_start = (raw_start_range / WHEEL_MOD) * WHEEL_MOD;
 
 		uint64_t total_numbers_in_launch = dispatch_blocks * subblock_size + (raw_start_range - range_start);
 
