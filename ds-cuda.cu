@@ -4,8 +4,8 @@
 // This program searches for ds(n) numbers.
 //
 // The GPU is used identify candidate numbers by:
-// 1. Using a mod-510510 prime wheel to reject any number that is a
-//    multiple of 2, 3, 5, 7, 11, 13, or 17 (this rejects 81.95% of candidates)
+// 1. Using a mod-9699690 prime wheel to reject any number that is a
+//    multiple of 2, 3, 5, 7, 11, 13, 17, or 19 (this rejects 82.90% of candidates)
 // 2. Checking if the digit sums are prime in the following
 //    bases in this order: (powers of two) 2, 4, 16, 8, 32,
 //                         (even bases)    12, 6, 10, 14,
@@ -58,11 +58,13 @@ std::string formatCommas(uint64_t num)
 }
 
 // Prime wheel geometry.
-// WHEEL_MOD   = 2*3*5*7*11*13*17
-// WHEEL_COUNT = phi(WHEEL_MOD) = 1*2*4*6*10*12*16, i.e. the residues coprime
-//               to all seven primes. 92160/510510 = 18.05% survive the wheel
-#define WHEEL_MOD 510510ULL
-#define WHEEL_COUNT 92160U
+// WHEEL_MOD   = 2*3*5*7*11*13*17*19
+// WHEEL_COUNT = phi(WHEEL_MOD) = 1*2*4*6*10*12*16*18, i.e. the residues coprime
+//               to all eight primes. 1658880/9699690 = 17.10% survive the
+//               wheel, against 92160/510510 = 18.05% for mod-510510 and
+//               5760/30030 = 19.18% for the original mod-30030 wheel.
+#define WHEEL_MOD 9699690ULL
+#define WHEEL_COUNT 1658880U
 
 // Block size on the GPU
 // Kept at 768 for optimal 2-block SM occupancy and register mapping
@@ -431,13 +433,13 @@ void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t s
 	}
 }
 
-// Prime wheel 510510 offsets.
-// Offsets now reach 510509, so they need uint32 and the table is 360 KB --
-// far past the 64 KB constant bank, so it lives in global memory instead.
-// This costs nothing in the loop: each thread reads exactly one offset before
-// the walk begins, and consecutive lanes read consecutive entries, so a warp
-// takes a single coalesced 128-byte transaction per launch.
-__device__ uint32_t d_wheel_510510[WHEEL_COUNT];
+// Prime wheel offsets. Offsets reach 9699689, so they need uint32 and the
+// table is 6.33 MB -- far past the 64 KB constant bank, so it lives in global
+// memory. This still costs nothing in the loop: each thread reads exactly one
+// offset before the walk begins, and consecutive lanes read consecutive
+// entries, so a warp takes a single coalesced 128-byte transaction per launch.
+// The 6.33 MB working set sits comfortably in L2 on any target part.
+__device__ uint32_t d_wheel[WHEEL_COUNT];
 
 // This is the GPU kernel that filters candidate numbers
 // It's templated on minimum base to remove rendundant base checks at lower bases
@@ -508,7 +510,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	const uint8_t *__restrict__ const local_b6 = s_b6;
 	const uint8_t *__restrict__ const local_b10 = s_b10;
 
-	// Calculate global thread mapping for Wheel 510510
+	// Calculate global thread mapping for the prime wheel
 	const uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
 
 	// Constant division will be replaced by the compiler for speed
@@ -516,7 +518,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	const uint64_t cycle = global_id / (uint64_t)WHEEL_COUNT;
 
 	// Initial candidate; one coalesced load per warp, hoisted out of the walk
-	uint64_t candidate = start_range + (cycle * WHEEL_MOD) + __ldg(&d_wheel_510510[wheel_idx]);
+	uint64_t candidate = start_range + (cycle * WHEEL_MOD) + __ldg(&d_wheel[wheel_idx]);
 
 	// Wait for the tables to finish copying
 	__pipeline_commit();
@@ -1300,16 +1302,17 @@ int main(int argc, char **argv)
 	for (uint32_t i = 0; i < base15Size; i++)
 		h_base15[i] = sumDigits(i, 15);
 
-	// Setup mod-510510 wheel in Global Memory
-	// 'static' keeps this 360 KB table out of the stack -- main() already holds
-	// roughly 190 KB of digit-sum tables and the default MSVC stack is 1 MB.
-	static uint32_t h_wheel_510510[WHEEL_COUNT];
+	// Setup the prime wheel in Global Memory.
+	// 'static' keeps this 6.33 MB table out of the stack -- main() already
+	// holds roughly 190 KB of digit-sum tables and the default MSVC stack is
+	// 1 MB, so a stack allocation this size would blow it outright.
+	static uint32_t h_wheel[WHEEL_COUNT];
 	uint32_t w_idx = 0;
 	for (uint32_t i = 1; i < (uint32_t)WHEEL_MOD; i++)
 	{
-		if (i % 2 != 0 && i % 3 != 0 && i % 5 != 0 && i % 7 != 0 && i % 11 != 0 && i % 13 != 0 && i % 17 != 0)
+		if (i % 2 != 0 && i % 3 != 0 && i % 5 != 0 && i % 7 != 0 && i % 11 != 0 && i % 13 != 0 && i % 17 != 0 && i % 19 != 0)
 		{
-			h_wheel_510510[w_idx++] = i;
+			h_wheel[w_idx++] = i;
 		}
 	}
 	if (w_idx != WHEEL_COUNT)
@@ -1317,7 +1320,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Wheel build failed: got %u offsets, expected %u\n", w_idx, WHEEL_COUNT);
 		return 1;
 	}
-	CUDA_CHECK(cudaMemcpyToSymbol(d_wheel_510510, h_wheel_510510, sizeof(h_wheel_510510)));
+	CUDA_CHECK(cudaMemcpyToSymbol(d_wheel, h_wheel, sizeof(h_wheel)));
 
 	// Allocate the small primes array and digit sum arrays on the device
 	uint8_t *d_sp, *d_b3, *d_b5, *d_b6, *d_b7, *d_b9, *d_b10, *d_b11, *d_b12, *d_b13, *d_b14, *d_b15;
@@ -1377,41 +1380,79 @@ int main(int argc, char **argv)
 		free_buffers.push({h_buffer_pool[i], event});
 	}
 
-	// The small primes array and digit sum arrays for bases 12, 6 and 10 fit in shared memory
-	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
-
 	int numSMs;
 	CUDA_CHECK(cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0));
 	int blockSize = BLOCK_SIZE; // Fixed 768
-	int gridSize = numSMs * 32;
+	int gridSize = 0;
 
-	const int gridQuantum = (int)(WHEEL_COUNT / (uint32_t)blockSize);   // 120
+	// Shared memory footprint. Declared here because the occupancy query below
+	// needs it; it is used again at every kernel launch.
+	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
 
-	// Query resident blocks per SM rather than trusting __launch_bounds__
+	// ---- Grid sizing --------------------------------------------------
+	// Two constraints have to be satisfied at once.
+	//
+	// Wheel alignment: each thread owns exactly one wheel offset for the life
+	// of the kernel, so (gridSize * blockSize) must be a whole number of wheel
+	// revolutions. At 768 threads the quantum is WHEEL_COUNT / 768, which is
+	// 2160 blocks for the mod-9699690 wheel (it was 120 for mod-510510).
+	//
+	// Wave alignment: __launch_bounds__ keeps 2 blocks resident per SM, so the
+	// GPU runs waves of (2 * numSMs) blocks. A grid leaving a partial final
+	// wave idles most of the machine for that wave's duration.
+	const int gridQuantum = (int)(WHEEL_COUNT / (uint32_t)blockSize);
+
+	// Query the resident block count rather than trusting __launch_bounds__.
 	int blocksPerSM = 0;
 	CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-	&blocksPerSM, unifiedSearchKernel<32>, blockSize, shared_mem_bytes));
+		&blocksPerSM, unifiedSearchKernel<32>, blockSize, shared_mem_bytes));
 	if (blocksPerSM < 1)
-	blocksPerSM = 1;
+		blocksPerSM = 1;
 	const int wave = numSMs * blocksPerSM;
 
-	// Smallest multiple of the quantum that wastes least of the final wave
-	int bestGrid = gridQuantum;
-	int bestWaves = (gridQuantum + wave - 1) / wave;
-	for (int g = gridQuantum + gridQuantum; g <= wave * 32; g += gridQuantum)
+	// Smallest grid whose final wave is at least 99.5% full. Deliberately NOT
+	// the fullest grid: a larger grid means a larger stride, which shortens the
+	// high-word hoist window and raises the per-candidate share of the outer
+	// loop. That outer loop costs roughly 114 cycles (eight POPCs plus the mask
+	// work for DS32_HI) amortised over 2^32 / stride inner iterations. At the
+	// mod-510510 quantum of 120 the effect was invisible; at 2160 chasing the
+	// last half-percent of fill costs several times what it returns. On 70 SMs
+	// the exact-fill grid is 15120 blocks -- 100% fill, but a 67.9M stride and
+	// only 63 inner iterations, which is 3.3% of outer-loop overhead against
+	// 0.9% at 4320 blocks.
+	for (int g = gridQuantum; g <= gridQuantum * 16; g += gridQuantum)
 	{
 		const int waves = (g + wave - 1) / wave;
-		// g / waves > bestGrid / bestWaves, cross-multiplied
-		if ((long long)g * bestWaves > (long long)bestGrid * waves)
+		if ((long long)g * 1000 >= (long long)waves * wave * 995)
 		{
-			bestGrid = g;
-			bestWaves = waves;
+			gridSize = g;
+			break;
 		}
 	}
-	gridSize = bestGrid;
+
+	// Nothing cleared the threshold: fall back to whichever grid fills best.
+	// Integer cross-multiplication, so no floating point and no tie-break
+	// epsilon; the strict > keeps the smallest grid among equal fills.
+	if (gridSize == 0)
+	{
+		gridSize = gridQuantum;
+		int bestWaves = (gridQuantum + wave - 1) / wave;
+		for (int g = gridQuantum * 2; g <= gridQuantum * 16; g += gridQuantum)
+		{
+			const int waves = (g + wave - 1) / wave;
+			if ((long long)g * bestWaves > (long long)gridSize * waves)
+			{
+				gridSize = g;
+				bestWaves = waves;
+			}
+		}
+	}
 
 	// Calculate stride based on perfect alignment
-	// stride = exactly how many full wheels the grid processes per inner loop iteration
+	// stride = exactly how many full wheels the grid processes per inner loop
+	// iteration. 46 SMs: (4320 * 768 / 1658880) * 9699690 = 2 * 9699690
+	// = 19,399,380, leaving the high-word hoist ~221 inner iterations per
+	// outer iteration.
 	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / (uint64_t)WHEEL_COUNT) * WHEEL_MOD;
 
 	// Get the GPU name
@@ -1505,7 +1546,7 @@ int main(int argc, char **argv)
 
 		uint64_t raw_start_range = current_block * subblock_size;
 
-		// Update bounds logic to explicitly align with the 510510 jump space
+		// Update bounds logic to explicitly align with the wheel jump space
 		uint64_t range_start = (raw_start_range / WHEEL_MOD) * WHEEL_MOD;
 
 		uint64_t total_numbers_in_launch = dispatch_blocks * subblock_size + (raw_start_range - range_start);
