@@ -736,15 +736,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 						break;
 				}
 
-				// Base 32
-				if constexpr (MIN_BASE >= 32)
-				{
-					const uint32_t ds32 = DS32_HI + pc_lo + __popc(lo & 0x84210842u) + 3u * __popc(lo & 0x08421084u) + 7u * __popc(lo & 0x10842108u) + 15u * __popc(lo & 0x21084210u);
-
-					if (!local_sp[ds32])
-						break;
-				}
-
 				// Remaining even bases are stronger filters than odd bases
 				// Each filter from here uses division by constants which are replaced by the compiler
 				// and narrow to 32 bit as soon as possible
