@@ -7,7 +7,7 @@
 // 1. Using a mod-9699690 prime wheel to reject any number that is a
 //    multiple of 2, 3, 5, 7, 11, 13, 17, or 19 (this rejects 82.90% of candidates)
 // 2. Checking if the digit sums are prime in the following
-//    bases in this order: (powers of two) 2, 4, 16, 8, 32,
+//    bases in this order: (powers of two) 2, 4, 8, 16, 32,
 //                         (even bases)    12, 6, 10, 14,
 //                         (odd bases)     5, 9, 3, 11, 7, 13, 15
 // The powers of two use popcount instructions with a small
@@ -22,8 +22,8 @@
 // the other is processing the next block of candidates in
 // parallel.
 //
-// Results are appended to 'ds-records.txt'.
-// A progress heartbeat is written to 'ds-state.txt' every minute
+// Results are appended to 'ds_records.txt'.
+// A progress heartbeat is written to 'ds_state.txt' every minute
 // containing the command to restart from the last heartbeat.
 
 #include <stdio.h>
@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <inttypes.h>
+#include <errno.h>
 #include <algorithm>
 #include <thread>
 #include <mutex>
@@ -43,6 +44,10 @@
 #include <string>
 #include <cuda_runtime.h>
 #include <cuda_pipeline_primitives.h>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 
 // Helper function to format large integers with commas
 std::string formatCommas(uint64_t num)
@@ -140,6 +145,13 @@ const uint32_t base14Size16 = (base14Size + ALIGN) & ~ALIGN;
 const uint32_t base15Size16 = (base15Size + ALIGN) & ~ALIGN;
 
 // Host Verification
+//
+// The MSVC path uses the 128-bit multiply/divide intrinsics. _udiv128 raises
+// #DE if the quotient will not fit in 64 bits, which here requires high >= n:
+// every caller reduces both operands mod n first, so a*b < n^2 and
+// high = (a*b)>>64 < n^2/2^64 < n. The precondition therefore holds for every
+// reachable call, and spsp() is only entered for n >= 41 with bases <= 37.
+#if defined(_MSC_VER)
 static uint64_t mulmod(uint64_t a, uint64_t b, uint64_t n)
 {
 	uint64_t high, low, remainder;
@@ -147,6 +159,12 @@ static uint64_t mulmod(uint64_t a, uint64_t b, uint64_t n)
 	_udiv128(high, low, n, &remainder);
 	return remainder;
 }
+#else
+static uint64_t mulmod(uint64_t a, uint64_t b, uint64_t n)
+{
+	return (uint64_t)(((unsigned __int128)a * (unsigned __int128)b) % (unsigned __int128)n);
+}
+#endif
 
 static uint64_t powmod(uint64_t a, uint64_t r, uint64_t n)
 {
@@ -354,6 +372,26 @@ inline uint64_t sumDigitsFast(uint64_t value, uint32_t radix)
 	}
 }
 
+// ---------------------------------------------------------------------------
+// GPU / CPU shared contract.
+//
+// The kernel is only instantiated at a small set of MIN_BASE values, so the
+// MIN_BASE actually compiled into a launch is NOT always the campaign's current
+// minbase -- a campaign at minbase 31 runs the MIN_BASE=16 instantiation, and
+// anything at or above 32 runs MIN_BASE=32.
+//
+// The CPU verifier decides which bases it can skip by assuming the GPU already
+// checked them. If the launch dispatcher and the verifier ever disagree about
+// which MIN_BASE was compiled in, the verifier will skip a base the kernel never
+// looked at and the run will emit a FALSE RECORD with nothing to detect it.
+// Both sides therefore route through this one function, and the value stored in
+// the payload is the instantiated MIN_BASE, never the raw campaign minbase.
+// ---------------------------------------------------------------------------
+constexpr uint32_t instantiatedMinBase(uint32_t mb)
+{
+	return (mb >= 32u) ? 32u : ((mb >= 16u) ? 16u : mb);
+}
+
 struct BufferBundle
 {
 	uint64_t *memory;
@@ -378,6 +416,9 @@ std::atomic<uint32_t> global_minbase{0};
 std::atomic<bool> global_target_achieved{false};
 uint8_t *global_smallprimes;
 
+// argv[0], so the restart line in the heartbeat names the binary that wrote it
+const char *global_program_name = "ds";
+
 constexpr int POOL_SIZE = 4;
 uint64_t *h_buffer_pool[POOL_SIZE];
 
@@ -399,12 +440,20 @@ void logRecord(uint32_t base, uint64_t candidate)
 	printf(">>> NEW RECORD FOUND: ds(%u) = %s <<<\n", base, formatted_candidate.c_str());
 	fflush(stdout);
 
-	// Append to file
+	// Append to file. A failure here is loud: the record only otherwise exists
+	// in the scrollback of whatever terminal is running the campaign.
 	FILE *f = fopen("ds_records.txt", "a");
 	if (f != NULL)
 	{
 		fprintf(f, ">>> NEW RECORD FOUND: ds(%u) = %s <<<\n", base, formatted_candidate.c_str());
 		fclose(f);
+	}
+	else
+	{
+		fprintf(stderr,
+			  "WARNING: could not open ds_records.txt -- ds(%u) = %s exists only on stdout\n",
+			  base, formatted_candidate.c_str());
+		fflush(stderr);
 	}
 }
 
@@ -415,22 +464,61 @@ void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t s
 
 	// Open in overwrite mode ("w") so it only stores the latest state
 	FILE *f = fopen("ds_state.txt", "w");
-	if (f != NULL)
+	if (f == NULL)
 	{
-		time_t rawtime;
-		struct tm *timeinfo;
-		char buffer[80];
-		time(&rawtime);
-		timeinfo = localtime(&rawtime);
-		strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
-
-		fprintf(f, "--- ENGINE HEARTBEAT ---\n");
-		fprintf(f, "Last Saved: %s\n", buffer);
-		fprintf(f, "Restart Command Args:\n");
-		fprintf(f, ".\\ds %" PRIu64 " %" PRIu64 " %" PRIu64 " %u %u\n",
-			  completed_block + 1, end_block, subblock_size, current_base, max_base);
-		fclose(f);
+		fprintf(stderr, "WARNING: could not write ds_state.txt -- progress is not being checkpointed\n");
+		fflush(stderr);
+		return;
 	}
+
+	time_t rawtime;
+	struct tm *timeinfo;
+	char buffer[80];
+	time(&rawtime);
+	timeinfo = localtime(&rawtime);
+	strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+
+	fprintf(f, "--- ENGINE HEARTBEAT ---\n");
+	fprintf(f, "Last Saved: %s\n", buffer);
+	fprintf(f, "Restart Command Args:\n");
+	fprintf(f, "%s %" PRIu64 " %" PRIu64 " %" PRIu64 " %u %u\n",
+		  global_program_name, completed_block + 1, end_block, subblock_size, current_base, max_base);
+	fclose(f);
+}
+
+// Strict command line integer parsing. An unchecked strtoull turns a typo into
+// a silent zero, and a zero subblock_size makes the whole campaign a no-op that
+// still reports success.
+static uint64_t parseU64(const char *text, const char *name)
+{
+	char *endp = NULL;
+	errno = 0;
+	unsigned long long v = strtoull(text, &endp, 10);
+	if (endp == text || *endp != '\0' || errno == ERANGE)
+	{
+		fprintf(stderr, "Error: could not parse %s from '%s'.\n", name, text);
+		exit(EXIT_FAILURE);
+	}
+	return (uint64_t)v;
+}
+
+// The GPU result buffer is a hard capacity, not a soft one. Silently truncating
+// a sub-block means the range was never fully searched while the run still
+// reports success, and for a "smallest prime" hunt a skipped candidate is
+// unrecoverable and undetectable. Fail the run instead.
+static uint32_t checkResultCount(uint32_t count, uint64_t block_id)
+{
+	if ((uint64_t)count > MAX_GPU_RESULTS)
+	{
+		fprintf(stderr,
+			  "FATAL: GPU result buffer overflowed at sub-block %" PRIu64 " -- %u hits against a "
+			  "capacity of %" PRIu64 ".\n"
+			  "       This range was NOT fully searched. Reduce subblock_size, reduce the\n"
+			  "       dynamic batch for this minbase, or raise MAX_GPU_RESULTS and rerun it.\n",
+			  block_id, count, (uint64_t)MAX_GPU_RESULTS);
+		exit(EXIT_FAILURE);
+	}
+	return count;
 }
 
 // Prime wheel offsets. Offsets reach 9699689, so they need uint32 and the
@@ -441,11 +529,40 @@ void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t s
 // The 6.33 MB working set sits comfortably in L2 on any target part.
 __device__ uint32_t d_wheel[WHEEL_COUNT];
 
+// Base 8 filter body.
+//
+// Braced rather than do/while(0) on purpose: `break` has to target the enclosing
+// filter cascade, and a do/while wrapper would swallow it.
+#define DS_FILTER_BASE8()                                                     \
+	{                                                                       \
+		const uint32_t ds8 = DS8_HI + pc_lo + __popc(lo & 0x92492492u) +  \
+					   3u * __popc(lo & 0x24924924u);               \
+		if (!local_sp[ds8])                                               \
+			break;                                                      \
+	}
+
+// Base 16 filter body. Nibble fold, then accumulate straight onto the cached
+// high-word byte sum with a single dp4a.
+#define DS_FILTER_BASE16()                                                       \
+	if constexpr (MIN_BASE >= 16)                                              \
+	{                                                                        \
+		const uint32_t n_low = (lo & 0x0F0F0F0F) + ((lo >> 4) & 0x0F0F0F0F); \
+		const uint32_t ds16 = __dp4a(n_low, 0x01010101U, DS16_HI);           \
+		if (!local_sp[ds16])                                                 \
+			break;                                                       \
+	}
+
 // This is the GPU kernel that filters candidate numbers
 // It's templated on minimum base to remove rendundant base checks at lower bases
+//
+// PRECONDITION: end_range <= UINT64_MAX - stride. The host enforces this when it
+// validates the campaign range, which is what lets the inner walk do a bare
+// `candidate += stride` with no wrap test on the hot path -- without the
+// guarantee, a walk that reached the top of the uint64 range would wrap to a
+// small value, satisfy `candidate < end_range` again and spin.
 template <uint32_t MIN_BASE>
 __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
-    const uint64_t start_range, const uint64_t total_numbers, const uint64_t end_range,
+    const uint64_t start_range, const uint64_t end_range,
     const uint8_t *__restrict__ g_sp, const uint32_t sp_size,
     uint64_t *__restrict__ d_results, uint32_t *__restrict__ d_count,
     const uint8_t *__restrict__ b3, const uint8_t *__restrict__ b5,
@@ -456,21 +573,29 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
     const uint8_t *__restrict__ b15,
     const uint64_t stride)
 {
-	// Shared memory
-	extern __shared__ uint8_t s_mem[];
+	// Shared memory.
+	//
+	// Declared as uint4 rather than uint8_t so the 16-byte alignment comes from
+	// the type itself. The loaders below issue 16-byte __pipeline_memcpy_async
+	// stores into this block, and a uint8_t declaration only guarantees byte
+	// alignment -- dynamic shared memory happens to be 16-byte aligned in every
+	// current runtime, but a misaligned 16-byte shared store is an
+	// illegal-address abort rather than a slow path, so the guarantee is worth
+	// taking from the type system instead of from the runtime's habits.
+	extern __shared__ uint4 s_mem_aligned[];
+	uint8_t *const s_mem = (uint8_t *)s_mem_aligned;
 
 	// Constant pointers to mutable shared memory during initialization
 	uint8_t *const s_sp = s_mem;
 	uint8_t *const s_b12 = s_sp + sp_size;
 	uint8_t *const s_b6 = s_b12 + base12Size16;
-	uint8_t *const s_b10 = s_b6 + base6Size16;
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
-	// Only bases 12, 6, and 10 are promoted to shared memory here -- these were
-	// empirically confirmed to be the highest-traffic filters worth the shared
-	// memory budget; the small-primes table is also promoted since every base
-	// check indexes into it. Bases 5, 9, 3, 7, 11, 13, 14, 15 stay in global
-	// memory and are read through __ldg() instead (see below).
+	// Only bases 12 and 6 are promoted // to shared memory here
+	// -- these were empirically confirmed to be the
+	// highest-traffic filters worth the shared memory budget; the small-primes
+	// table is also promoted since every base check indexes into it. The
+	// remaining bases stay in global memory and are read through __ldg().
 	// Scoped to allow const parameters on iterators and pointers
 	{
 		uint4 *const shared = (uint4 *)s_sp;
@@ -489,14 +614,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	}
 
 	{
-		uint4 *const shared = (uint4 *)s_b10;
-		const uint4 *const global = (const uint4 *)b10;
-		const uint32_t words = base10Size16 >> 4;
-		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-			__pipeline_memcpy_async(&shared[i], &global[i], 16);
-	}
-
-	{
 		uint4 *const shared = (uint4 *)s_b12;
 		const uint4 *const global = (const uint4 *)b12;
 		const uint32_t words = base12Size16 >> 4;
@@ -508,7 +625,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	const uint8_t *__restrict__ const local_sp = s_sp;
 	const uint8_t *__restrict__ const local_b12 = s_b12;
 	const uint8_t *__restrict__ const local_b6 = s_b6;
-	const uint8_t *__restrict__ const local_b10 = s_b10;
 
 	// Calculate global thread mapping for the prime wheel
 	const uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -620,6 +736,15 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 						break;
 				}
 
+				// Base 32
+				if constexpr (MIN_BASE >= 32)
+				{
+					const uint32_t ds32 = DS32_HI + pc_lo + __popc(lo & 0x84210842u) + 3u * __popc(lo & 0x08421084u) + 7u * __popc(lo & 0x10842108u) + 15u * __popc(lo & 0x21084210u);
+
+					if (!local_sp[ds32])
+						break;
+				}
+
 				// Remaining even bases are stronger filters than odd bases
 				// Each filter from here uses division by constants which are replaced by the compiler
 				// and narrow to 32 bit as soon as possible
@@ -630,7 +755,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 				// NOTE on gating: bases 2, 4, 8, 3, 6, 5, 9, 7 are checked
 				// UNCONDITIONALLY regardless of MIN_BASE (they're cheap and always in
-				// scope). Bases 16, 32, 12, 10, 14, 11, 13, 15 are gated by
+				// scope, because the campaign never enters the kernel below minbase 9).
+				// Bases 16, 32, 12, 10, 14, 11, 13, 15 are gated by
 				// `if constexpr (MIN_BASE >= N)` and compiled out entirely for kernel
 				// instantiations targeting a lower MIN_BASE.
 
@@ -710,26 +836,26 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 					uint32_t sum = 0;
 					uint64_t r64 = v_hi;
 					uint64_t rq64 = r64 / 10000ULL;
-					sum += local_b10[r64 - rq64 * 10000ULL];
+					sum += __ldg(&b10[r64 - rq64 * 10000ULL]);
 
 					r64 = rq64;
 					uint32_t r = (uint32_t)r64;
 					uint32_t rq = r / 10000U;
-					sum += local_b10[r - rq * 10000U];
+					sum += __ldg(&b10[r - rq * 10000U]);
 
 					r = rq;
-					sum += local_b10[r];
+					sum += __ldg(&b10[r]);
 
 					r = v_low;
 					rq = r / 10000U;
-					sum += local_b10[r - rq * 10000U];
+					sum += __ldg(&b10[r - rq * 10000U]);
 
 					r = rq;
 					rq = r / 10000U;
-					sum += local_b10[r - rq * 10000U];
+					sum += __ldg(&b10[r - rq * 10000U]);
 
 					r = rq;
-					sum += local_b10[r];
+					sum += __ldg(&b10[r]);
 
 					if (!local_sp[sum])
 						break;
@@ -1007,7 +1133,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			// (no point using __ballot_sync() since chance of multiple threads passing is tiny)
 			if (pass)
 			{
-				// Add candidate to the result list
+				// Add candidate to the result list.
+				// The counter is deliberately allowed to run past the buffer so
+				// the host can see the true hit count and abort, rather than
+				// saturating and reporting a full buffer as a normal result.
 				uint32_t idx = atomicAdd(d_count, 1);
 
 				// Ensure result buffer doesn't overflow
@@ -1017,6 +1146,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				}
 			}
 
+			// Safe without a wrap test: the host guarantees
+			// end_range <= UINT64_MAX - stride, so candidate < hi_limit <= end_range
+			// implies candidate + stride cannot overflow.
 			candidate += stride;
 		}
 	}
@@ -1043,13 +1175,20 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 			verification_queue.pop();
 		}
 
+		// A dispatch that produced no candidates still gets a payload, with a
+		// null bundle. It carries no data but it does carry the completed
+		// sub-block id, which is what keeps the heartbeat advancing through
+		// long empty stretches at high minbase.
+		const bool has_buffer = (task.bundle.memory != nullptr);
+
 		// Wait for the DMA transfer to physically finish across the PCIe bus
-		CUDA_CHECK(cudaEventSynchronize(task.bundle.ready_event));
+		if (has_buffer)
+			CUDA_CHECK(cudaEventSynchronize(task.bundle.ready_event));
 
 		auto start_time = std::chrono::high_resolution_clock::now();
 		size_t survivor_count = 0;
 
-		if (task.candidate_count > 0)
+		if (has_buffer && task.candidate_count > 0)
 		{
 			std::vector<uint64_t> survivors;
 			uint32_t current_needed = global_minbase.load();
@@ -1063,7 +1202,10 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 			{
 				bool checked_by_gpu = false;
 
-				// Only assume the GPU checked it if it was within the kernel's target scope
+				// Only assume the GPU checked it if it was within the scope of the
+				// MIN_BASE that was actually instantiated for that launch (see
+				// instantiatedMinBase) -- not the campaign minbase, which can be
+				// higher than the kernel that ran.
 				if (b <= task.kernel_minbase)
 				{
 					// SWAR Bases handled by GPU
@@ -1200,7 +1342,9 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 			 global_minbase.load() - 1, formatted_subblock.c_str(), formatted_candidate_count.c_str(), formatted_survivor_count.c_str(), elapsed.count());
 		fflush(stdout);
 
-		// Heartbeat to save state at regular intervals
+		// Heartbeat to save state at regular intervals. Every dispatch reaches
+		// this point, empty or not, so the checkpoint keeps moving even when
+		// the GPU is returning nothing at all.
 		auto current_time = std::chrono::steady_clock::now();
 		if (std::chrono::duration_cast<std::chrono::seconds>(current_time - last_heartbeat_time) >= HEARTBEAT_INTERVAL)
 		{
@@ -1209,11 +1353,14 @@ void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max
 		}
 
 		// Return the buffer and event bundle to the pool for the GPU to reuse
+		if (has_buffer)
 		{
-			std::lock_guard<std::mutex> lock(pool_mutex);
-			free_buffers.push(task.bundle);
+			{
+				std::lock_guard<std::mutex> lock(pool_mutex);
+				free_buffers.push(task.bundle);
+			}
+			pool_cv.notify_one();
 		}
-		pool_cv.notify_one();
 	}
 }
 
@@ -1222,27 +1369,56 @@ int main(int argc, char **argv)
 {
 	if (argc != 6)
 	{
-		fprintf(stderr, "Usage: %s start_subblock end_subblock subblock_size minbase maxbase\n", argv[0]);
+		fprintf(stderr, "Usage: %s start_subblock end_subblock subblock_size minbase maxbase\n",
+			  (argc > 0 && argv[0] != NULL) ? argv[0] : "ds");
 		exit(EXIT_FAILURE);
 	}
 
+	if (argv[0] != NULL && argv[0][0] != '\0')
+		global_program_name = argv[0];
+
 	CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
 
-	uint64_t start_block = strtoull(argv[1], NULL, 10);
-	uint64_t end_block = strtoull(argv[2], NULL, 10);
-	uint64_t subblock_size = strtoull(argv[3], NULL, 10);
+	uint64_t start_block = parseU64(argv[1], "start_subblock");
+	uint64_t end_block = parseU64(argv[2], "end_subblock");
+	uint64_t subblock_size = parseU64(argv[3], "subblock_size");
 
-	global_minbase.store(strtoul(argv[4], NULL, 10));
-	uint32_t max_target_base = strtoul(argv[5], NULL, 10);
+	uint64_t minbase_arg = parseU64(argv[4], "minbase");
+	uint64_t maxbase_arg = parseU64(argv[5], "maxbase");
 
 	// verificationWorker builds a checklist bases_to_check[MAX_BASE] and fills it
 	// for bases 2..max_fast_check (bounded by max_target_base). Without this guard, a
 	// max_target_base >= MAX_BASE silently overflows that stack array
-	if (max_target_base < 2 || max_target_base >= MAX_BASE)
+	if (maxbase_arg < 2 || maxbase_arg >= MAX_BASE)
 	{
-		fprintf(stderr, "Error: maxbase must be in range [2, %u). Got %u.\n", MAX_BASE, max_target_base);
+		fprintf(stderr, "Error: maxbase must be in range [2, %u). Got %" PRIu64 ".\n", MAX_BASE, maxbase_arg);
 		exit(EXIT_FAILURE);
 	}
+
+	// minbase is allowed to sit one past maxbase: that is the "campaign already
+	// finished" state a resume can legitimately be handed.
+	if (minbase_arg < 2 || minbase_arg > maxbase_arg + 1)
+	{
+		fprintf(stderr, "Error: minbase must be in range [2, %" PRIu64 "]. Got %" PRIu64 ".\n",
+			  maxbase_arg + 1, minbase_arg);
+		exit(EXIT_FAILURE);
+	}
+
+	if (subblock_size == 0)
+	{
+		fprintf(stderr, "Error: subblock_size must be non-zero.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	if (start_block > end_block)
+	{
+		fprintf(stderr, "Error: start_subblock (%" PRIu64 ") is past end_subblock (%" PRIu64 ").\n",
+			  start_block, end_block);
+		exit(EXIT_FAILURE);
+	}
+
+	global_minbase.store((uint32_t)minbase_arg);
+	uint32_t max_target_base = (uint32_t)maxbase_arg;
 
 	uint32_t largestds = 65 * (max_target_base - 1);
 	uint32_t sp_bytes = largestds + 1;
@@ -1254,58 +1430,63 @@ int main(int argc, char **argv)
 
 	// Compute the small primes array
 	global_smallprimes = (uint8_t *)calloc(sp_bytes, sizeof(uint8_t));
+	if (global_smallprimes == NULL)
+	{
+		fprintf(stderr, "Error: could not allocate the small primes table.\n");
+		exit(EXIT_FAILURE);
+	}
 	for (uint32_t i = 0; i <= largestds; i++)
 		global_smallprimes[i] = cpu_isPrime(i) ? 1 : 0;
 
-	// Compute the digit sum arrays for each non-power-of-2 base
-	uint8_t h_base3[base3Size];
+	// Compute the digit sum arrays for each non-power-of-2 base.
+	// 'static' keeps roughly 191 KB of tables off the stack; the default MSVC
+	// stack is only 1 MB and these were most of it.
+	static uint8_t h_base3[base3Size];
 	for (uint32_t i = 0; i < base3Size; i++)
 		h_base3[i] = sumDigits(i, 3);
 
-	uint8_t h_base5[base5Size];
+	static uint8_t h_base5[base5Size];
 	for (uint32_t i = 0; i < base5Size; i++)
 		h_base5[i] = sumDigits(i, 5);
 
-	uint8_t h_base6[base6Size];
+	static uint8_t h_base6[base6Size];
 	for (uint32_t i = 0; i < base6Size; i++)
 		h_base6[i] = sumDigits(i, 6);
 
-	uint8_t h_base7[base7Size];
+	static uint8_t h_base7[base7Size];
 	for (uint32_t i = 0; i < base7Size; i++)
 		h_base7[i] = sumDigits(i, 7);
 
-	uint8_t h_base9[base9Size];
+	static uint8_t h_base9[base9Size];
 	for (uint32_t i = 0; i < base9Size; i++)
 		h_base9[i] = sumDigits(i, 9);
 
-	uint8_t h_base10[base10Size];
+	static uint8_t h_base10[base10Size];
 	for (uint32_t i = 0; i < base10Size; i++)
 		h_base10[i] = sumDigits(i, 10);
 
-	uint8_t h_base11[base11Size];
+	static uint8_t h_base11[base11Size];
 	for (uint32_t i = 0; i < base11Size; i++)
 		h_base11[i] = sumDigits(i, 11);
 
-	uint8_t h_base12[base12Size];
+	static uint8_t h_base12[base12Size];
 	for (uint32_t i = 0; i < base12Size; i++)
 		h_base12[i] = sumDigits(i, 12);
 
-	uint8_t h_base13[base13Size];
+	static uint8_t h_base13[base13Size];
 	for (uint32_t i = 0; i < base13Size; i++)
 		h_base13[i] = sumDigits(i, 13);
 
-	uint8_t h_base14[base14Size];
+	static uint8_t h_base14[base14Size];
 	for (uint32_t i = 0; i < base14Size; i++)
 		h_base14[i] = sumDigits(i, 14);
 
-	uint8_t h_base15[base15Size];
+	static uint8_t h_base15[base15Size];
 	for (uint32_t i = 0; i < base15Size; i++)
 		h_base15[i] = sumDigits(i, 15);
 
 	// Setup the prime wheel in Global Memory.
-	// 'static' keeps this 6.33 MB table out of the stack -- main() already
-	// holds roughly 190 KB of digit-sum tables and the default MSVC stack is
-	// 1 MB, so a stack allocation this size would blow it outright.
+	// 'static' keeps this 6.33 MB table out of the stack.
 	static uint32_t h_wheel[WHEEL_COUNT];
 	uint32_t w_idx = 0;
 	for (uint32_t i = 1; i < (uint32_t)WHEEL_MOD; i++)
@@ -1337,6 +1518,22 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaMalloc((void **)&d_b14, base14Size16));
 	CUDA_CHECK(cudaMalloc((void **)&d_b15, base15Size16));
 
+	// Zero the alignment padding. The tables are rounded up to 128 bytes and the
+	// shared-memory loaders copy the full padded length, so the tails would
+	// otherwise be uninitialised device memory. They are never indexed, but this
+	// keeps compute-sanitizer --tool initcheck clean.
+	CUDA_CHECK(cudaMemset(d_b3, 0, base3Size16));
+	CUDA_CHECK(cudaMemset(d_b5, 0, base5Size16));
+	CUDA_CHECK(cudaMemset(d_b6, 0, base6Size16));
+	CUDA_CHECK(cudaMemset(d_b7, 0, base7Size16));
+	CUDA_CHECK(cudaMemset(d_b9, 0, base9Size16));
+	CUDA_CHECK(cudaMemset(d_b10, 0, base10Size16));
+	CUDA_CHECK(cudaMemset(d_b11, 0, base11Size16));
+	CUDA_CHECK(cudaMemset(d_b12, 0, base12Size16));
+	CUDA_CHECK(cudaMemset(d_b13, 0, base13Size16));
+	CUDA_CHECK(cudaMemset(d_b14, 0, base14Size16));
+	CUDA_CHECK(cudaMemset(d_b15, 0, base15Size16));
+
 	// Copy the small primes array and digit sum arrays from the host to the device
 	CUDA_CHECK(cudaMemcpy(d_sp, global_smallprimes, sp_bytes, cudaMemcpyHostToDevice));
 	CUDA_CHECK(cudaMemcpy(d_b3, h_base3, base3Size, cudaMemcpyHostToDevice));
@@ -1359,7 +1556,10 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaMalloc((void **)&d_count_A, sizeof(uint32_t)));
 	CUDA_CHECK(cudaMalloc((void **)&d_count_B, sizeof(uint32_t)));
 
-	uint32_t *h_count_A, *h_count_B;
+	// volatile: these are pinned completion flags written by the copy engine.
+	// cudaStreamSynchronize is opaque enough that the compiler must reload them
+	// today, but volatile is the correct idiom and costs nothing.
+	volatile uint32_t *h_count_A, *h_count_B;
 	CUDA_CHECK(cudaHostAlloc((void **)&h_count_A, sizeof(uint32_t), cudaHostAllocDefault));
 	CUDA_CHECK(cudaHostAlloc((void **)&h_count_B, sizeof(uint32_t), cudaHostAllocDefault));
 
@@ -1387,7 +1587,7 @@ int main(int argc, char **argv)
 
 	// Shared memory footprint. Declared here because the occupancy query below
 	// needs it; it is used again at every kernel launch.
-	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
+	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16;
 
 	// ---- Grid sizing --------------------------------------------------
 	// Two constraints have to be satisfied at once.
@@ -1403,9 +1603,12 @@ int main(int argc, char **argv)
 	const int gridQuantum = (int)(WHEEL_COUNT / (uint32_t)blockSize);
 
 	// Query the resident block count rather than trusting __launch_bounds__.
+	// MIN_BASE=32 is the heaviest instantiation, so it is the conservative one
+	// to size against: lower instantiations use fewer registers and can only be
+	// at least as resident, never less.
 	int blocksPerSM = 0;
 	CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-		&blocksPerSM, unifiedSearchKernel<32>, blockSize, shared_mem_bytes));
+	    &blocksPerSM, unifiedSearchKernel<32>, blockSize, shared_mem_bytes));
 	if (blocksPerSM < 1)
 		blocksPerSM = 1;
 	const int wave = numSMs * blocksPerSM;
@@ -1455,6 +1658,23 @@ int main(int argc, char **argv)
 	// outer iteration.
 	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / (uint64_t)WHEEL_COUNT) * WHEEL_MOD;
 
+	// ---- Range validation ---------------------------------------------
+	// The kernel walks with a bare `candidate += stride` and no wrap test, which
+	// is only sound while end_range <= UINT64_MAX - stride. Everything the loop
+	// below can produce is bounded by end_block * subblock_size, so bounding
+	// that one product covers raw_start_range, range_start and end_range at once
+	// -- and it simultaneously rules out the silent overflow of
+	// current_block * subblock_size in the dispatch loop.
+	const uint64_t range_ceiling = UINT64_MAX - stride;
+	if (end_block > range_ceiling / subblock_size)
+	{
+		fprintf(stderr,
+			  "Error: end_subblock * subblock_size (%" PRIu64 " * %" PRIu64 ") exceeds the safe\n"
+			  "       64-bit search ceiling of %" PRIu64 ".\n",
+			  end_block, subblock_size, range_ceiling);
+		exit(EXIT_FAILURE);
+	}
+
 	// Get the GPU name
 	int deviceId;
 	CUDA_CHECK(cudaGetDevice(&deviceId));
@@ -1464,10 +1684,15 @@ int main(int argc, char **argv)
 	printf("====================================================\n");
 	printf(" Active GPU: %s Compute %d.%d\n", prop.name, prop.major, prop.minor);
 	printf(" Execution Grid Topology: %d blocks x %d threads\n", gridSize, blockSize);
+	printf(" Shared Memory: %zu bytes/block (%zu for %d resident)\n",
+		 shared_mem_bytes, shared_mem_bytes * (size_t)blocksPerSM, blocksPerSM);
 	printf(" Campaign Scope Targets: Bases %u to %u\n", global_minbase.load(), max_target_base);
 	printf("====================================================\n");
 
-	// Output the trivial entries which are ds(1) through ds(7)
+	// Output the trivial entries which are ds(1) through ds(7).
+	// This also guarantees that minbase is at least 9 by the time the dispatch
+	// loop runs, which is the precondition for the kernel's unconditional
+	// bases 3, 5, 6, 7, 8 and 9 to be in scope.
 	if (global_minbase.load() <= 2 && 2 <= max_target_base)
 	{
 		logRecord(1, 3);
@@ -1518,6 +1743,18 @@ int main(int argc, char **argv)
 	uint64_t dispatched_block_id_A = 0, dispatched_block_id_B = 0;
 	uint32_t dispatched_minbase_A = 0, dispatched_minbase_B = 0;
 
+	// Push a payload for a dispatch that returned no candidates at all. It has
+	// no buffer and no work, but it carries the completed sub-block id so the
+	// heartbeat keeps advancing through empty stretches.
+	auto queue_empty_payload = [&](uint64_t raw_start, uint64_t block_id, uint32_t mb)
+	{
+		{
+			std::lock_guard<std::mutex> lock(queue_mutex);
+			verification_queue.push({{nullptr, nullptr}, 0u, raw_start, block_id, mb});
+		}
+		queue_cv.notify_one();
+	};
+
 	// Main loop: launch the next block of candidate numbers to the GPU kernel
 	// Two compute streams are used (A and B) so the results from the last stream can be
 	// asynchronously fetched while the new block is running
@@ -1554,44 +1791,49 @@ int main(int argc, char **argv)
 		// Templated Cuda kernel launch so the kernel only contains the checks needed for the current base
 		auto launch_search = [&](cudaStream_t stream, uint64_t start, uint64_t total, uint64_t *results, uint32_t *count, uint32_t mb)
 		{
-			if (mb >= 32)
+			switch (instantiatedMinBase(mb))
 			{
-				unifiedSearchKernel<32><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+			case 32:
+				unifiedSearchKernel<32><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 16:
+				unifiedSearchKernel<16><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 15:
+				unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 14:
+				unifiedSearchKernel<14><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 13:
+				unifiedSearchKernel<13><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 12:
+				unifiedSearchKernel<12><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 11:
+				unifiedSearchKernel<11><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 10:
+				unifiedSearchKernel<10><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			case 9:
+				unifiedSearchKernel<9><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
+				break;
+			default:
+				// Unreachable: the trivial ds(1)..ds(7) seeding above lifts
+				// minbase to at least 9 before the dispatch loop runs. Loud
+				// rather than silently substituting a wrong instantiation,
+				// because a kernel that over-filters produces wrong terms.
+				fprintf(stderr, "FATAL: no kernel instantiation for minbase %u.\n", mb);
+				exit(EXIT_FAILURE);
 			}
-			else if (mb >= 16)
-			{
-				unifiedSearchKernel<16><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-			}
-			else
-			{
-				switch (mb)
-				{
-				case 9:
-					unifiedSearchKernel<9><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				case 10:
-					unifiedSearchKernel<10><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				case 11:
-					unifiedSearchKernel<11><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				case 12:
-					unifiedSearchKernel<12><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				case 13:
-					unifiedSearchKernel<13><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				case 14:
-					unifiedSearchKernel<14><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				case 15:
-					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				default:
-					unifiedSearchKernel<15><<<gridSize, blockSize, shared_mem_bytes, stream>>>(start, total, start + total, d_sp, sp_bytes, results, count, d_b3, d_b5, d_b6, d_b7, d_b9, d_b10, d_b11, d_b12, d_b13, d_b14, d_b15, stride);
-					break;
-				}
-			}
+
+			// Launch failures are asynchronous and otherwise invisible here: the
+			// count would stay at its memset zero, no payload would be queued,
+			// and the dispatch loop would advance as though the range had simply
+			// held no candidates. A skipped range then gets checkpointed as done.
+			CUDA_CHECK(cudaGetLastError());
 		};
 
 		// Ping-pong across A and B
@@ -1605,9 +1847,10 @@ int main(int argc, char **argv)
 			{
 				CUDA_CHECK(cudaStreamSynchronize(stream_A));
 
-				if (*h_count_A > 0)
+				const uint32_t hits_A = checkResultCount(*h_count_A, dispatched_block_id_A);
+
+				if (hits_A > 0)
 				{
-					uint32_t fetch_count = (*h_count_A > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_A;
 					BufferBundle bundle;
 					{
 						std::unique_lock<std::mutex> lock(pool_mutex);
@@ -1617,15 +1860,19 @@ int main(int argc, char **argv)
 						free_buffers.pop();
 					}
 
-					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_A, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
+					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_A, (size_t)hits_A * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
 					CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
 					drain_event_A = bundle.ready_event;
 
 					{
 						std::lock_guard<std::mutex> lock(queue_mutex);
-						verification_queue.push({bundle, fetch_count, start_range_A, dispatched_block_id_A, dispatched_minbase_A});
+						verification_queue.push({bundle, hits_A, start_range_A, dispatched_block_id_A, dispatched_minbase_A});
 					}
 					queue_cv.notify_one();
+				}
+				else
+				{
+					queue_empty_payload(start_range_A, dispatched_block_id_A, dispatched_minbase_A);
 				}
 			}
 
@@ -1639,11 +1886,11 @@ int main(int argc, char **argv)
 
 			CUDA_CHECK(cudaMemsetAsync(d_count_A, 0, sizeof(uint32_t), stream_A));
 			launch_search(stream_A, range_start, total_numbers_in_launch, d_results_A, d_count_A, active_minbase);
-			CUDA_CHECK(cudaMemcpyAsync(h_count_A, d_count_A, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_A));
+			CUDA_CHECK(cudaMemcpyAsync((void *)h_count_A, d_count_A, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_A));
 
 			start_range_A = raw_start_range;
 			dispatched_block_id_A = current_block + dispatch_blocks - 1;
-			dispatched_minbase_A = active_minbase;
+			dispatched_minbase_A = instantiatedMinBase(active_minbase);
 			stream_A_inflight = true;
 			buffer_A_active = false;
 		}
@@ -1657,9 +1904,10 @@ int main(int argc, char **argv)
 			{
 				CUDA_CHECK(cudaStreamSynchronize(stream_B));
 
-				if (*h_count_B > 0)
+				const uint32_t hits_B = checkResultCount(*h_count_B, dispatched_block_id_B);
+
+				if (hits_B > 0)
 				{
-					uint32_t fetch_count = (*h_count_B > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_B;
 					BufferBundle bundle;
 					{
 						std::unique_lock<std::mutex> lock(pool_mutex);
@@ -1669,15 +1917,19 @@ int main(int argc, char **argv)
 						free_buffers.pop();
 					}
 
-					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_B, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
+					CUDA_CHECK(cudaMemcpyAsync(bundle.memory, d_results_B, (size_t)hits_B * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream_transfer));
 					CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
 					drain_event_B = bundle.ready_event;
 
 					{
 						std::lock_guard<std::mutex> lock(queue_mutex);
-						verification_queue.push({bundle, fetch_count, start_range_B, dispatched_block_id_B, dispatched_minbase_B});
+						verification_queue.push({bundle, hits_B, start_range_B, dispatched_block_id_B, dispatched_minbase_B});
 					}
 					queue_cv.notify_one();
+				}
+				else
+				{
+					queue_empty_payload(start_range_B, dispatched_block_id_B, dispatched_minbase_B);
 				}
 			}
 
@@ -1687,11 +1939,11 @@ int main(int argc, char **argv)
 
 			CUDA_CHECK(cudaMemsetAsync(d_count_B, 0, sizeof(uint32_t), stream_B));
 			launch_search(stream_B, range_start, total_numbers_in_launch, d_results_B, d_count_B, active_minbase);
-			CUDA_CHECK(cudaMemcpyAsync(h_count_B, d_count_B, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_B));
+			CUDA_CHECK(cudaMemcpyAsync((void *)h_count_B, d_count_B, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream_B));
 
 			start_range_B = raw_start_range;
 			dispatched_block_id_B = current_block + dispatch_blocks - 1;
-			dispatched_minbase_B = active_minbase;
+			dispatched_minbase_B = instantiatedMinBase(active_minbase);
 			stream_B_inflight = true;
 			buffer_A_active = true;
 		}
@@ -1704,9 +1956,11 @@ int main(int argc, char **argv)
 		if (stream_A_inflight)
 		{
 			CUDA_CHECK(cudaStreamSynchronize(stream_A));
-			if (*h_count_A > 0)
+
+			const uint32_t hits_A = checkResultCount(*h_count_A, dispatched_block_id_A);
+
+			if (hits_A > 0)
 			{
-				uint32_t fetch_count = (*h_count_A > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_A;
 				BufferBundle bundle;
 
 				{
@@ -1717,13 +1971,17 @@ int main(int argc, char **argv)
 					free_buffers.pop();
 				}
 
-				CUDA_CHECK(cudaMemcpy(bundle.memory, d_results_A, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+				CUDA_CHECK(cudaMemcpy(bundle.memory, d_results_A, (size_t)hits_A * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 				CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
 				{
 					std::lock_guard<std::mutex> lock(queue_mutex);
-					verification_queue.push({bundle, fetch_count, start_range_A, dispatched_block_id_A, dispatched_minbase_A});
+					verification_queue.push({bundle, hits_A, start_range_A, dispatched_block_id_A, dispatched_minbase_A});
 				}
 				queue_cv.notify_one();
+			}
+			else
+			{
+				queue_empty_payload(start_range_A, dispatched_block_id_A, dispatched_minbase_A);
 			}
 		}
 	};
@@ -1733,9 +1991,11 @@ int main(int argc, char **argv)
 		if (stream_B_inflight)
 		{
 			CUDA_CHECK(cudaStreamSynchronize(stream_B));
-			if (*h_count_B > 0)
+
+			const uint32_t hits_B = checkResultCount(*h_count_B, dispatched_block_id_B);
+
+			if (hits_B > 0)
 			{
-				uint32_t fetch_count = (*h_count_B > MAX_GPU_RESULTS) ? MAX_GPU_RESULTS : *h_count_B;
 				BufferBundle bundle;
 				{
 					std::unique_lock<std::mutex> lock(pool_mutex);
@@ -1744,17 +2004,22 @@ int main(int argc, char **argv)
 					bundle = free_buffers.front();
 					free_buffers.pop();
 				}
-				CUDA_CHECK(cudaMemcpy(bundle.memory, d_results_B, fetch_count * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+				CUDA_CHECK(cudaMemcpy(bundle.memory, d_results_B, (size_t)hits_B * sizeof(uint64_t), cudaMemcpyDeviceToHost));
 				CUDA_CHECK(cudaEventRecord(bundle.ready_event, stream_transfer));
 				{
 					std::lock_guard<std::mutex> lock(queue_mutex);
-					verification_queue.push({bundle, fetch_count, start_range_B, dispatched_block_id_B, dispatched_minbase_B});
+					verification_queue.push({bundle, hits_B, start_range_B, dispatched_block_id_B, dispatched_minbase_B});
 				}
 				queue_cv.notify_one();
+			}
+			else
+			{
+				queue_empty_payload(start_range_B, dispatched_block_id_B, dispatched_minbase_B);
 			}
 		}
 	};
 
+	// Drain oldest first so the "smallest prime" ordering survives teardown.
 	if (!buffer_A_active)
 	{
 		push_B();
@@ -1807,8 +2072,8 @@ int main(int argc, char **argv)
 	CUDA_CHECK(cudaFree(d_results_B));
 	CUDA_CHECK(cudaFree(d_count_A));
 	CUDA_CHECK(cudaFree(d_count_B));
-	CUDA_CHECK(cudaFreeHost(h_count_A));
-	CUDA_CHECK(cudaFreeHost(h_count_B));
+	CUDA_CHECK(cudaFreeHost((void *)h_count_A));
+	CUDA_CHECK(cudaFreeHost((void *)h_count_B));
 
 	for (int i = 0; i < POOL_SIZE; i++)
 	{
