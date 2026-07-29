@@ -49,6 +49,122 @@
 #include <intrin.h>
 #endif
 
+// ---------------------------------------------------------------------------
+// Tuning switches
+//
+// Both of these are A/B toggles for measured optimizations. They are on by
+// default because the modelling favours them, but they change only performance
+// and never results -- flipping either must leave per-sub-block candidate
+// counts bit-identical, which is the regression test to run after a flip.
+// ---------------------------------------------------------------------------
+
+// Run the base 8 filter before the base 16 filter.
+//
+// Base 8 is the stronger filter of the two: measured on wheel survivors at the
+// ~4.25e16 search depth its marginal pass rate is 0.2875 against base 16's
+// 0.4167. Because the cumulative survival entering base 32 is independent of
+// the ordering of the four filters above it, the entire effect lands on the
+// fourth stage: the old order pays base 8's cost at 0.917 warp-reach, the new
+// order pays base 16's cost at ~0.775. Modelled saving is 2.9% of warp
+// instruction slots, and the sign of the change does not depend on the relative
+// cost of the two filters -- putting the stronger filter first wins even when
+// the costs are identical.
+#define DS_B8_BEFORE_B16 0
+
+// Keep the whole DS*_HI chain pinned in registers across the inner loop.
+//
+// The Nsight source view showed `__popc(hi)` executing 214,411,441 times, i.e.
+// 2.01 per INNER iteration, despite being written as an outer-loop invariant.
+// Every other hoisted value behaved (DS4_HI 2.00/outer, DS8_HI 4.00/outer,
+// DS32_HI 8.00/outer, DS16_HI 1.00/outer) -- only this one got sunk, and live
+// registers peak at 19 against the 31 allocated, so it is not register pressure.
+// Half of those 214M instructions are POPC, which runs at 16 results/clk/SM on
+// sm_89 against 64 for add/logic/shift, so they cost four times an ordinary op.
+// The empty asm makes the value opaque to ptxas and blocks the rematerialisation.
+//
+// MEASURED, in three rounds: 1735 against a 1732 baseline, and 1950 against
+// 1947 with DS_DIRECT_EMIT on -- +0.17% both times, i.e. nothing.
+//
+// The re-profile explained why, and it is worth recording. Pinning DS2_HI worked
+// exactly as intended: that line dropped from 214,411,441 instructions (2.01 per
+// INNER iteration) to 622,085 (1.00 per outer). But DS4_HI, which derives from it,
+// went the other way -- from 1,244,170 (2.00 per outer) to 215,033,526 (2.01 per
+// inner). Totals 215.6M before, 215.6M after: ptxas relocated the identical
+// rematerialisation one step down the derivation chain rather than giving it up.
+//
+// The reason it keeps doing this is that `hi` is the high half of the candidate
+// register pair, so it is free to re-read, and ptxas does not model POPC as the
+// quarter-rate instruction it is on sm_89. Recomputing looks cheap to it.
+//
+// Pinning DS2_HI and DS4_HI together then moved it a THIRD time, onto DS8_HI
+// (2,488,340 -> 216,277,696, i.e. 4.00 per outer becoming 2.02 per inner). Total
+// instructions were identical across that change -- 3.8731e9 against 3.8725e9 --
+// yet throughput rose 1.14% (1967.95 -> 1990.43) and stall samples fell 9.5%.
+//
+// That is the useful result: the gain had nothing to do with how much work there
+// is and everything to do with where it sits. DS4_HI feeds ds4, the top stall line,
+// on the critical path to the FIRST branch, executed by every lane every iteration.
+// DS8_HI feeds the base 8 filter, further down. Relocating the recompute off the
+// critical chain was worth 1.14% at zero instruction cost.
+//
+// ptxas will recompute exactly one masked-popcount pair inside the loop no matter
+// which variable it takes it from -- it is freeing a single register, and `hi` is
+// the high half of the candidate pair so re-reading it is free. The only way to
+// stop it is to make every link opaque, which is what this does.
+#define DS_PIN_HI_CHAIN 1
+
+// Emit surviving candidates from inside the filter cascade instead of setting a
+// flag and testing it afterwards.
+//
+// `if (pass)` measured 4.00 instructions per inner iteration and 12.98% of all
+// warp stall samples -- third largest in the kernel -- for what is nominally a
+// boolean test. That is the flag init, the set, the test, the branch and the
+// reconvergence bookkeeping. The break statements already skip the tail of the
+// do/while(0), so emitting there is identical in behaviour.
+//
+// MEASURED: 1947 against a 1732 baseline -- +12.4%, the largest single win since
+// high-word hoisting. Note this exceeded the 9.50% instruction share, matching the
+// 12.98% STALL share instead: on an issue-limited kernel, removing stalls pays more
+// than removing instructions.
+#define DS_DIRECT_EMIT 1
+
+// Drive the inner loop from a 32-bit trip count instead of a 64-bit comparison.
+//
+// `while (candidate < hi_limit)` measured 4.02 instructions per inner iteration
+// (the ISETP.GE.U32 / IMAD.EX / ISETP.GE.U32 / AND sequence) and 7.36% of stall
+// samples. The trip count is computed once per outer iteration and amortised
+// over 171.8 inner iterations. Note this is NOT the documented two-halves dead
+// end: the candidate stays a single 64-bit value, so every digit-sum path is
+// untouched and only the loop condition changes.
+//
+// MEASURED TWICE, both regressions. Do not retry this.
+//   1687 against a 1732 baseline  (-2.6%)
+//   1978 against a 2038.71 baseline (-2.98%)
+//
+// The second test was run after DS_DIRECT_EMIT and DS_PIN_HI_CHAIN had removed
+// ~750M instructions and four registers, and after the loop condition itself had
+// grown from 4.02 to 6.02 instructions per iteration -- i.e. under conditions that
+// should have favoured it far more than the first test. Same sign, same magnitude.
+//
+// The 64-bit compare is genuinely free: it issues in slots the warp is stalled on
+// anyway, so its 7-9% stall attribution is warps queueing at the loop back-edge,
+// not the compare costing anything. Replacing free instructions with a divide on
+// the critical path loses every time. Kept at 0 and retained only so the result
+// stays reproducible.
+#define DS_TRIP_COUNTER 0
+
+// Keep the base 10 lookup table in shared memory.
+//
+// With base 10 resident the block's shared footprint is 34,928 bytes, so two
+// resident blocks need 69,856 and force the 100 KB shared carveout on Ada,
+// leaving only 28 KB of L1 out of the 128 KB unified cache. Dropping base 10 to
+// global __ldg brings the block to 24,816 bytes / 49,632 for two, which fits the
+// 64 KB carveout and more than doubles L1 to 64 KB for every other table plus
+// the 6.33 MB wheel. Base 10 is reached by only ~0.8% of warp-iterations, so the
+// traded-away shared residency is worth roughly 0.04 global loads per
+// warp-iteration against a 2.3x larger L1.
+#define DS_B10_IN_SHARED 0
+
 // Helper function to format large integers with commas
 std::string formatCommas(uint64_t num)
 {
@@ -589,10 +705,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	uint8_t *const s_sp = s_mem;
 	uint8_t *const s_b12 = s_sp + sp_size;
 	uint8_t *const s_b6 = s_b12 + base12Size16;
+#if DS_B10_IN_SHARED
+	uint8_t *const s_b10 = s_b6 + base6Size16;
+#endif
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
-	// Only bases 12 and 6 are promoted // to shared memory here
-	// -- these were empirically confirmed to be the
+	// Only bases 12 and 6 (and optionally 10, see DS_B10_IN_SHARED) are promoted
+	// to shared memory here -- these were empirically confirmed to be the
 	// highest-traffic filters worth the shared memory budget; the small-primes
 	// table is also promoted since every base check indexes into it. The
 	// remaining bases stay in global memory and are read through __ldg().
@@ -613,6 +732,16 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			__pipeline_memcpy_async(&shared[i], &global[i], 16);
 	}
 
+#if DS_B10_IN_SHARED
+	{
+		uint4 *const shared = (uint4 *)s_b10;
+		const uint4 *const global = (const uint4 *)b10;
+		const uint32_t words = base10Size16 >> 4;
+		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
+			__pipeline_memcpy_async(&shared[i], &global[i], 16);
+	}
+#endif
+
 	{
 		uint4 *const shared = (uint4 *)s_b12;
 		const uint4 *const global = (const uint4 *)b12;
@@ -625,6 +754,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	const uint8_t *__restrict__ const local_sp = s_sp;
 	const uint8_t *__restrict__ const local_b12 = s_b12;
 	const uint8_t *__restrict__ const local_b6 = s_b6;
+#if DS_B10_IN_SHARED
+	const uint8_t *__restrict__ const local_b10 = s_b10;
+#define DS_B10_LOOKUP(idx) (local_b10[(idx)])
+#else
+#define DS_B10_LOOKUP(idx) (__ldg(&b10[(idx)]))
+#endif
 
 	// Calculate global thread mapping for the prime wheel
 	const uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -654,14 +789,33 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// the whole inner loop. Each mask below is the top half of the
 		// corresponding 64-bit mask in the original kernel.
 
-		// Base 2: popcount of the high word
+		// Base 2: popcount of the high word.
+		// See DS_PIN_HI_CHAIN -- without the barrier ptxas sinks this back into the
+		// inner loop and re-runs a quarter-rate POPC on every candidate.
+#if DS_PIN_HI_CHAIN
+		uint32_t DS2_HI = __popc(hi);
+		asm("" : "+r"(DS2_HI));
+#else
 		const uint32_t DS2_HI = __popc(hi);
+#endif
 
-		// Base 4: ds4 = ds2 + (count of set bits in odd positions)
+		// Base 4: ds4 = ds2 + (count of set bits in odd positions).
+		// Pinned as well -- see DS_PIN_HI_CHAIN. With only DS2_HI opaque, ptxas simply
+		// moved the rematerialisation here instead, for no net change.
+#if DS_PIN_HI_CHAIN
+		uint32_t DS4_HI = DS2_HI + __popc(hi & 0xAAAAAAAAu);
+		asm("" : "+r"(DS4_HI));
+#else
 		const uint32_t DS4_HI = DS2_HI + __popc(hi & 0xAAAAAAAAu);
+#endif
 
 		// Base 8: ds8 = ds2 + P1 + 3*P2, Pj = set bits at positions == j (mod 3)
+#if DS_PIN_HI_CHAIN
+		uint32_t DS8_HI = DS2_HI + __popc(hi & 0x24924924u) + 3u * __popc(hi & 0x49249249u);
+		asm("" : "+r"(DS8_HI));
+#else
 		const uint32_t DS8_HI = DS2_HI + __popc(hi & 0x24924924u) + 3u * __popc(hi & 0x49249249u);
+#endif
 
 		// Base 16: nibble fold, then horizontal byte sum
 		uint32_t DS16_HI = 0u;
@@ -669,6 +823,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		{
 			const uint32_t n_high = (hi & 0x0F0F0F0F) + ((hi >> 4) & 0x0F0F0F0F);
 			DS16_HI = __dp4a(n_high, 0x01010101U, 0U);
+#if DS_PIN_HI_CHAIN
+			asm("" : "+r"(DS16_HI));
+#endif
 		}
 
 		// Base 32: ds32 = ds2 + P1 + 3*P2 + 7*P3 + 15*P4, Pj mod 5
@@ -676,6 +833,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		if constexpr (MIN_BASE >= 32)
 		{
 			DS32_HI = DS2_HI + __popc(hi & 0x21084210u) + 3u * __popc(hi & 0x42108421u) + 7u * __popc(hi & 0x84210842u) + 15u * __popc(hi & 0x08421084u);
+#if DS_PIN_HI_CHAIN
+			asm("" : "+r"(DS32_HI));
+#endif
 		}
 
 		// Upper bound of this high-word window, clamped to the launch range.
@@ -687,12 +847,28 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// -----------------------------------------------------------------
 		// INNER LOOP: only the low 32 bits vary.
 		// -----------------------------------------------------------------
-		while (candidate < hi_limit)
+#if DS_TRIP_COUNTER
+		// hi_limit - candidate is at most 2^32 (candidate >= hi << 32 and
+		// hi_limit <= (hi + 1) << 32), so delta - 1 always fits a uint32 and the
+		// divide narrows to 32 bits. stride is validated < 2^32 on the host.
+		const uint32_t delta_m1 = (uint32_t)(hi_limit - candidate - 1ULL);
+		const uint32_t n_iter = delta_m1 / (uint32_t)stride + 1u;
+
+		for (uint32_t k = 0; k < n_iter; k++)
 		{
 			const uint32_t lo = (uint32_t)candidate;
 			const uint32_t pc_lo = __popc(lo);
 
+#else
+		while (candidate < hi_limit)
+		{
+			const uint32_t lo = (uint32_t)candidate;
+			const uint32_t pc_lo = __popc(lo);
+#endif
+
+#if !DS_DIRECT_EMIT
 			bool pass = false;
+#endif
 
 			// Check digit sum primality
 			// Base order is optimal for filter strength and check cost
@@ -709,23 +885,16 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				if (!(local_sp[p] & local_sp[ds4]))
 					break;
 
-				// Base 16
-				if constexpr (MIN_BASE >= 16)
-				{
-					const uint32_t n_low = (lo & 0x0F0F0F0F) + ((lo >> 4) & 0x0F0F0F0F);
-
-					// Accumulate straight onto the cached high-word byte sum
-					const uint32_t ds16 = __dp4a(n_low, 0x01010101U, DS16_HI);
-
-					if (!local_sp[ds16])
-						break;
-				}
-
-				// Base 8
-				const uint32_t ds8 = DS8_HI + pc_lo + __popc(lo & 0x92492492u) + 3u * __popc(lo & 0x24924924u);
-
-				if (!local_sp[ds8])
-					break;
+				// Base 8 and base 16, in whichever order DS_B8_BEFORE_B16 selects.
+				// Base 8 is the stronger filter, so running it first shrinks the
+				// warp-reach of everything below it.
+#if DS_B8_BEFORE_B16
+				DS_FILTER_BASE8()
+				DS_FILTER_BASE16()
+#else
+				DS_FILTER_BASE16()
+				DS_FILTER_BASE8()
+#endif
 
 				// Base 32
 				if constexpr (MIN_BASE >= 32)
@@ -827,26 +996,26 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 					uint32_t sum = 0;
 					uint64_t r64 = v_hi;
 					uint64_t rq64 = r64 / 10000ULL;
-					sum += __ldg(&b10[r64 - rq64 * 10000ULL]);
+					sum += DS_B10_LOOKUP(r64 - rq64 * 10000ULL);
 
 					r64 = rq64;
 					uint32_t r = (uint32_t)r64;
 					uint32_t rq = r / 10000U;
-					sum += __ldg(&b10[r - rq * 10000U]);
+					sum += DS_B10_LOOKUP(r - rq * 10000U);
 
 					r = rq;
-					sum += __ldg(&b10[r]);
+					sum += DS_B10_LOOKUP(r);
 
 					r = v_low;
 					rq = r / 10000U;
-					sum += __ldg(&b10[r - rq * 10000U]);
+					sum += DS_B10_LOOKUP(r - rq * 10000U);
 
 					r = rq;
 					rq = r / 10000U;
-					sum += __ldg(&b10[r - rq * 10000U]);
+					sum += DS_B10_LOOKUP(r - rq * 10000U);
 
 					r = rq;
-					sum += __ldg(&b10[r]);
+					sum += DS_B10_LOOKUP(r);
 
 					if (!local_sp[sum])
 						break;
@@ -1116,26 +1285,39 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 						break;
 				}
 
-				// If we successfully run the gauntlet without breaking
+				// Ran the whole gauntlet without breaking.
+				// (no point using __ballot_sync() since chance of multiple threads passing is tiny)
+#if DS_DIRECT_EMIT
+				// Emit here rather than via a flag: every break above already
+				// skips this, so the behaviour is identical and the per-iteration
+				// flag init / test / branch disappears entirely.
+				{
+					// The counter is deliberately allowed to run past the buffer so
+					// the host can see the true hit count and abort, rather than
+					// saturating and reporting a full buffer as a normal result.
+					uint32_t idx = atomicAdd(d_count, 1);
+
+					// Ensure result buffer doesn't overflow
+					if (idx < MAX_GPU_RESULTS)
+					{
+						d_results[idx] = candidate;
+					}
+				}
+#else
 				pass = true;
+#endif
 			} while (0);
 
-			// Check if the guantlet was passed
-			// (no point using __ballot_sync() since chance of multiple threads passing is tiny)
+#if !DS_DIRECT_EMIT
 			if (pass)
 			{
-				// Add candidate to the result list.
-				// The counter is deliberately allowed to run past the buffer so
-				// the host can see the true hit count and abort, rather than
-				// saturating and reporting a full buffer as a normal result.
 				uint32_t idx = atomicAdd(d_count, 1);
-
-				// Ensure result buffer doesn't overflow
 				if (idx < MAX_GPU_RESULTS)
 				{
 					d_results[idx] = candidate;
 				}
 			}
+#endif
 
 			// Safe without a wrap test: the host guarantees
 			// end_range <= UINT64_MAX - stride, so candidate < hi_limit <= end_range
@@ -1143,7 +1325,12 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			candidate += stride;
 		}
 	}
+
+#undef DS_B10_LOOKUP
 }
+
+#undef DS_FILTER_BASE8
+#undef DS_FILTER_BASE16
 
 // CPU verification worker that checks surviving candidates from the GPU filtering
 void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max_target_base)
@@ -1577,8 +1764,14 @@ int main(int argc, char **argv)
 	int gridSize = 0;
 
 	// Shared memory footprint. Declared here because the occupancy query below
-	// needs it; it is used again at every kernel launch.
+	// needs it; it is used again at every kernel launch. See DS_B10_IN_SHARED --
+	// dropping base 10 is what keeps two resident blocks inside the 64 KB
+	// carveout instead of forcing the 100 KB one.
+#if DS_B10_IN_SHARED
+	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
+#else
 	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16;
+#endif
 
 	// ---- Grid sizing --------------------------------------------------
 	// Two constraints have to be satisfied at once.
@@ -1649,6 +1842,16 @@ int main(int argc, char **argv)
 	// outer iteration.
 	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / (uint64_t)WHEEL_COUNT) * WHEEL_MOD;
 
+	// DS_TRIP_COUNTER narrows the inner-loop divide to 32 bits, which requires
+	// stride < 2^32. The largest grid the sizing loop can pick is 16 * gridQuantum,
+	// giving stride = 16 * WHEEL_MOD = 155,195,040, so this always holds -- but it
+	// is a silent correctness precondition, so check it rather than assume it.
+	if (stride == 0ULL || stride > 0xFFFFFFFFULL)
+	{
+		fprintf(stderr, "FATAL: stride %" PRIu64 " does not fit the 32-bit inner-loop trip count.\n", stride);
+		exit(EXIT_FAILURE);
+	}
+
 	// ---- Range validation ---------------------------------------------
 	// The kernel walks with a bare `candidate += stride` and no wrap test, which
 	// is only sound while end_range <= UINT64_MAX - stride. Everything the loop
@@ -1677,6 +1880,12 @@ int main(int argc, char **argv)
 	printf(" Execution Grid Topology: %d blocks x %d threads\n", gridSize, blockSize);
 	printf(" Shared Memory: %zu bytes/block (%zu for %d resident)\n",
 		 shared_mem_bytes, shared_mem_bytes * (size_t)blocksPerSM, blocksPerSM);
+	printf(" Filter Order: base 8 %s base 16, base 10 in %s\n",
+		 DS_B8_BEFORE_B16 ? "before" : "after", DS_B10_IN_SHARED ? "shared" : "global");
+	printf(" Inner Loop: DS*_HI chain %s, %s emit, %s loop condition\n",
+		 DS_PIN_HI_CHAIN ? "pinned" : "unpinned",
+		 DS_DIRECT_EMIT ? "direct" : "flagged",
+		 DS_TRIP_COUNTER ? "32-bit trip count" : "64-bit compare");
 	printf(" Campaign Scope Targets: Bases %u to %u\n", global_minbase.load(), max_target_base);
 	printf("====================================================\n");
 
