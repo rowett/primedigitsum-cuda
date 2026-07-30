@@ -130,6 +130,33 @@ std::string formatCommas(uint64_t num)
 #define WHEEL_MOD 9699690ULL
 #define WHEEL_COUNT 1658880U
 
+// WHEEL_MOD and WHEEL_COUNT must stay in lockstep: the build loop in main() writes
+// exactly one h_wheel[] entry per residue coprime to the eight primes, into an
+// array sized WHEEL_COUNT. If WHEEL_COUNT were ever smaller than phi(WHEEL_MOD) --
+// the obvious way to get that wrong is editing one constant and not the other --
+// the loop would write past the end of a 6.33 MB array long before any check could
+// notice. Deriving both from a single prime list makes that a compile error.
+constexpr uint32_t DS_WHEEL_PRIMES[] = {2u, 3u, 5u, 7u, 11u, 13u, 17u, 19u};
+
+constexpr uint64_t dsWheelMod()
+{
+	uint64_t m = 1;
+	for (uint32_t p : DS_WHEEL_PRIMES)
+		m *= p;
+	return m;
+}
+
+constexpr uint32_t dsWheelCount()
+{
+	uint32_t c = 1;
+	for (uint32_t p : DS_WHEEL_PRIMES)
+		c *= (p - 1u);
+	return c;
+}
+
+static_assert(dsWheelMod() == WHEEL_MOD, "WHEEL_MOD does not match DS_WHEEL_PRIMES");
+static_assert(dsWheelCount() == WHEEL_COUNT, "WHEEL_COUNT is not phi(WHEEL_MOD)");
+
 // Block size on the GPU
 // Kept at 768 for optimal 2-block SM occupancy and register mapping
 #define BLOCK_SIZE 768
@@ -475,8 +502,32 @@ std::atomic<uint32_t> global_minbase{0};
 std::atomic<bool> global_target_achieved{false};
 uint8_t *global_smallprimes;
 
-// argv[0], so the restart line in the heartbeat names the binary that wrote it
+// argv[0], so the restart line in the heartbeat names the binary that wrote it.
+//
+// This value is written verbatim into ds_state.txt on a line whose stated purpose
+// is to be run, and argv[0] is entirely under the caller's control -- execve() lets
+// it be set to any string at all, independent of the actual binary. A name
+// containing shell metacharacters would turn the checkpoint file into a command
+// injection aimed at whoever (or whatever script) resumes the run. It is filtered
+// on the way in rather than trusted.
 const char *global_program_name = "ds";
+
+static bool isSafeProgramName(const char *s)
+{
+	if (s == NULL || *s == '\0')
+		return false;
+	for (const char *c = s; *c != '\0'; ++c)
+	{
+		const unsigned char u = (unsigned char)*c;
+		const bool ok = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
+				    (u >= '0' && u <= '9') ||
+				    u == '.' || u == '_' || u == '-' ||
+				    u == '/' || u == '\\' || u == ':';
+		if (!ok)
+			return false;
+	}
+	return true;
+}
 
 constexpr int POOL_SIZE = 4;
 uint64_t *h_buffer_pool[POOL_SIZE];
@@ -521,11 +572,15 @@ void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t s
 {
 	std::lock_guard<std::mutex> lock(file_mutex);
 
-	// Open in overwrite mode ("w") so it only stores the latest state
-	FILE *f = fopen("ds_state.txt", "w");
+	// Written to a temporary file and moved into place, never truncated in situ.
+	// fopen("w") truncates immediately, so a crash or power loss anywhere between
+	// the truncate and the final fprintf would leave an empty or half-written
+	// checkpoint and lose the campaign's position. With a temp file the reader
+	// only ever sees the previous complete state or the new complete state.
+	FILE *f = fopen("ds_state.tmp", "w");
 	if (f == NULL)
 	{
-		fprintf(stderr, "WARNING: could not write ds_state.txt -- progress is not being checkpointed\n");
+		fprintf(stderr, "WARNING: could not write ds_state.tmp -- progress is not being checkpointed\n");
 		fflush(stderr);
 		return;
 	}
@@ -542,7 +597,19 @@ void saveHeartbeatState(uint64_t completed_block, uint64_t end_block, uint64_t s
 	fprintf(f, "Restart Command Args:\n");
 	fprintf(f, "%s %" PRIu64 " %" PRIu64 " %" PRIu64 " %u %u\n",
 		  global_program_name, completed_block + 1, end_block, subblock_size, current_base, max_base);
+	fflush(f);
 	fclose(f);
+
+	// POSIX rename() replaces atomically. Windows rename() fails if the target
+	// exists, so remove first -- that leaves a window where no state file exists,
+	// but never one where a partial state file exists, which is the failure that
+	// actually loses work.
+	remove("ds_state.txt");
+	if (rename("ds_state.tmp", "ds_state.txt") != 0)
+	{
+		fprintf(stderr, "WARNING: could not move ds_state.tmp into place -- checkpoint not updated\n");
+		fflush(stderr);
+	}
 }
 
 // Strict command line integer parsing. An unchecked strtoull turns a typo into
@@ -1435,7 +1502,9 @@ int main(int argc, char **argv)
 		exit(EXIT_FAILURE);
 	}
 
-	if (argv[0] != NULL && argv[0][0] != '\0')
+	// Anything with whitespace, quotes or shell metacharacters is dropped in favour
+	// of the safe default rather than echoed into the restart line.
+	if (isSafeProgramName(argv[0]))
 		global_program_name = argv[0];
 
 	CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
@@ -1554,6 +1623,14 @@ int main(int argc, char **argv)
 	{
 		if (i % 2 != 0 && i % 3 != 0 && i % 5 != 0 && i % 7 != 0 && i % 11 != 0 && i % 13 != 0 && i % 17 != 0 && i % 19 != 0)
 		{
+			// Bounded write. The static_asserts above make a mismatch a compile
+			// error, but this is the only unbounded write in the program and it
+			// targets a 6.33 MB array, so it is checked at runtime as well.
+			if (w_idx >= WHEEL_COUNT)
+			{
+				fprintf(stderr, "FATAL: wheel build overran %u offsets -- WHEEL_COUNT is wrong.\n", WHEEL_COUNT);
+				return 1;
+			}
 			h_wheel[w_idx++] = i;
 		}
 	}
