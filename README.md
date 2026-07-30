@@ -2,7 +2,7 @@
 
 A high-performance CUDA program that searches for **ds(n)** numbers: the smallest prime whose digit sum in every base from 2 through n+1 is also prime.
 
-Searches approximately **2.04 trillion numbers per second** on an RTX 4070.
+Searches approximately **2.18 trillion numbers per second** on an RTX 4070.
 
 ---
 
@@ -233,6 +233,20 @@ __device__ __forceinline__ void dsPinRegister(uint32_t &v)
 
 Two results from this are worth keeping. The +1.14% round came at an **identical instruction count** — 3.8731e9 against 3.8725e9 — because the gain was entirely in moving the recompute off the critical path feeding the first branch. And pinning five extra values *reduced* register usage from 31 to 27: the rematerialisation was not saving a register, it was costing four, since `hi` and the intermediate masks had to stay live to recompute from.
 
+### Inner Loop Unrolling
+
+`#pragma unroll 3` on the inner `while` is worth **+6.7%**. The trip count is not known at that point, so ptxas duplicates the body with an exit check between copies rather than producing a clean 3× body — but that still cuts the back-edge branch and the 64-bit `candidate < hi_limit` compare, which costs 6.02 instructions per iteration on its own, to a third. The larger effect is scheduling: three fully independent filter cascades give the scheduler something to interleave, and the kernel is issue-limited (0.87 warps/cycle against a ceiling of 1.0) rather than ALU-limited, so shortening dependency chains is what actually buys throughput.
+
+The factor was swept rather than guessed, against a 2040 G/s unrolled-1 baseline and a 0.27% variance floor:
+
+| unroll | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| G/s | 2040 | 2142 | **2176** | 2144 | 2125 | 2132 |
+
+2 and 4 differ by two, and 5 and 6 by seven — both inside noise. This is a genuine peak at 3 with everything else on a plateau about 1.5% below, not a curve to round up.
+
+This is **not** the "two candidates per thread" dead end. That tested two candidates inside a single cascade and lost early exit to intra-thread divergence. Here each unrolled copy keeps its own cascade and its own `break`s, so per-candidate divergence is unchanged.
+
 ### Direct Emission
 
 Survivors are emitted from inside the filter cascade rather than via a flag tested afterwards. The earlier form —
@@ -301,7 +315,8 @@ The kernel's arithmetic has been differentially tested against naive digit sums:
 | base 10 → global (64 KB carveout) | 1733 G/s | ×1.013 |
 | direct emission | 1947 G/s | ×1.124 |
 | DS\*_HI chain pinned | 2042.08 G/s | ×1.049 |
-| | | **×1.794 cumulative** |
+| inner loop unrolled 3× | 2176 G/s | ×1.066 |
+| | | **×1.912 cumulative** |
 
 Final figure verified over a 312.60 s sustained run, not a short benchmark. Run-to-run variance on a fixed block range is **0.27%**.
 

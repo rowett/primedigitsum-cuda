@@ -825,6 +825,25 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// -----------------------------------------------------------------
 		// INNER LOOP: only the low 32 bits vary.
 		// -----------------------------------------------------------------
+		// Unrolled 3x. The trip count is not known here, so ptxas duplicates the body
+		// with an exit check between copies rather than producing a clean 3x body --
+		// but that still cuts the back-edge branch and the 64-bit `candidate < hi_limit`
+		// compare (6.02 instructions per iteration on its own) to a third, and more
+		// importantly hands the scheduler three fully independent filter cascades to
+		// interleave. The kernel is issue-limited rather than ALU-limited, so shortening
+		// dependency chains is what buys throughput.
+		//
+		// Swept against a 2040 unrolled-1 baseline, variance floor 0.27%:
+		//   2x 2142   3x 2176   4x 2144   5x 2125   6x 2132
+		// 2 and 4 are two apart and 5 and 6 are seven apart -- both inside noise. So
+		// this is not a gentle curve but a genuine peak at 3 with everything else on a
+		// plateau ~1.5% below. Do not "round up" to 4.
+		//
+		// Note this is NOT the documented "two candidates per thread" dead end: that
+		// tested several candidates inside ONE cascade and lost early exit. Here each
+		// copy keeps its own cascade and its own breaks, so per-candidate divergence is
+		// unchanged -- which is why the checksum is identical at every unroll factor.
+#pragma unroll 3
 		while (candidate < hi_limit)
 		{
 			const uint32_t lo = (uint32_t)candidate;
