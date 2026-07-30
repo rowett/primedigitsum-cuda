@@ -645,6 +645,33 @@ static uint32_t checkResultCount(uint32_t count, uint64_t block_id)
 // The 6.33 MB working set sits comfortably in L2 on any target part.
 __device__ uint32_t d_wheel[WHEEL_COUNT];
 
+// Pin a loop invariant into a register for the life of the inner loop.
+//
+// Emits no instructions -- the empty asm has no PTX in it at all. The "+r"
+// constraint simply declares the value as both read and written by an opaque
+// operation, which stops ptxas deciding to recompute it inside the inner loop
+// instead of keeping it live. See DS_PIN_HI_CHAIN for why that matters here and
+// what it measured.
+//
+// Encapsulated for three reasons: the kernel body stays free of inline assembly,
+// the pinned expressions are written once instead of once per preprocessor arm
+// (they previously had to be kept in sync by hand), and there is a single place
+// to change if a future toolkit stops needing this. With DS_PIN_HI_CHAIN at 0
+// every call compiles to nothing at all.
+__device__ __forceinline__ void dsPinRegister(uint32_t &v)
+{
+	// __INTELLISENSE__ is defined only by the Microsoft IntelliSense engine, never by
+	// a real compiler. Its parser does not understand GCC-style extended asm (it wants
+	// the MSVC __asm block form) and flags the colon as "expected a ')'". Hiding the
+	// statement from it removes the squiggle in VS Code and Visual Studio without
+	// changing a single byte of what nvcc or clang actually compile.
+#if DS_PIN_HI_CHAIN && !defined(__INTELLISENSE__)
+	asm("" : "+r"(v));
+#else
+	(void)v;
+#endif
+}
+
 // Base 8 filter body.
 //
 // Braced rather than do/while(0) on purpose: `break` has to target the enclosing
@@ -792,30 +819,18 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// Base 2: popcount of the high word.
 		// See DS_PIN_HI_CHAIN -- without the barrier ptxas sinks this back into the
 		// inner loop and re-runs a quarter-rate POPC on every candidate.
-#if DS_PIN_HI_CHAIN
 		uint32_t DS2_HI = __popc(hi);
-		asm("" : "+r"(DS2_HI));
-#else
-		const uint32_t DS2_HI = __popc(hi);
-#endif
+		dsPinRegister(DS2_HI);
 
 		// Base 4: ds4 = ds2 + (count of set bits in odd positions).
 		// Pinned as well -- see DS_PIN_HI_CHAIN. With only DS2_HI opaque, ptxas simply
 		// moved the rematerialisation here instead, for no net change.
-#if DS_PIN_HI_CHAIN
 		uint32_t DS4_HI = DS2_HI + __popc(hi & 0xAAAAAAAAu);
-		asm("" : "+r"(DS4_HI));
-#else
-		const uint32_t DS4_HI = DS2_HI + __popc(hi & 0xAAAAAAAAu);
-#endif
+		dsPinRegister(DS4_HI);
 
 		// Base 8: ds8 = ds2 + P1 + 3*P2, Pj = set bits at positions == j (mod 3)
-#if DS_PIN_HI_CHAIN
 		uint32_t DS8_HI = DS2_HI + __popc(hi & 0x24924924u) + 3u * __popc(hi & 0x49249249u);
-		asm("" : "+r"(DS8_HI));
-#else
-		const uint32_t DS8_HI = DS2_HI + __popc(hi & 0x24924924u) + 3u * __popc(hi & 0x49249249u);
-#endif
+		dsPinRegister(DS8_HI);
 
 		// Base 16: nibble fold, then horizontal byte sum
 		uint32_t DS16_HI = 0u;
@@ -823,9 +838,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		{
 			const uint32_t n_high = (hi & 0x0F0F0F0F) + ((hi >> 4) & 0x0F0F0F0F);
 			DS16_HI = __dp4a(n_high, 0x01010101U, 0U);
-#if DS_PIN_HI_CHAIN
-			asm("" : "+r"(DS16_HI));
-#endif
+			dsPinRegister(DS16_HI);
 		}
 
 		// Base 32: ds32 = ds2 + P1 + 3*P2 + 7*P3 + 15*P4, Pj mod 5
@@ -833,9 +846,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		if constexpr (MIN_BASE >= 32)
 		{
 			DS32_HI = DS2_HI + __popc(hi & 0x21084210u) + 3u * __popc(hi & 0x42108421u) + 7u * __popc(hi & 0x84210842u) + 15u * __popc(hi & 0x08421084u);
-#if DS_PIN_HI_CHAIN
-			asm("" : "+r"(DS32_HI));
-#endif
+			dsPinRegister(DS32_HI);
 		}
 
 		// Upper bound of this high-word window, clamped to the launch range.
