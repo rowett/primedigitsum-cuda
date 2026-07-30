@@ -50,120 +50,63 @@
 #endif
 
 // ---------------------------------------------------------------------------
-// Tuning switches
+// Design decisions in the inner loop, and what each one measured.
 //
-// Both of these are A/B toggles for measured optimizations. They are on by
-// default because the modelling favours them, but they change only performance
-// and never results -- flipping either must leave per-sub-block candidate
-// counts bit-identical, which is the regression test to run after a flip.
+// These were all A/B toggles at one point. The winning arm is now the only arm;
+// the numbers are kept because they are the reason the code looks like this, and
+// because three of the six things tried here made it SLOWER. All figures come
+// from the same pinned benchmark range (see speed.bat) so they are comparable,
+// against a run-to-run variance floor of 0.27%.
+//
+// 1. BASE 16 RUNS BEFORE BASE 8.  Counter-intuitive: base 8 is the stronger
+//    filter (marginal pass 0.2875 against base 16's 0.4167), so filter-strength
+//    reasoning says run it first. Measured 1685 against 1711 -- a 1.3% LOSS.
+//    The reason is POPC. On sm_89 population count runs at 16 results/clk/SM
+//    against 64 for add, logic and shift, so it costs 4x an ordinary op. Base 8
+//    is 2 LOP3 + 2 POPC + IMAD + 2 IADD ~= 13 ALU-equivalents; base 16 is 2 LOP3
+//    + SHF + IADD + DP4A with no POPC at all ~= 5. Weighted properly base 8 is
+//    2.6x the cost, which swamps its extra filtering. Do not reorder these.
+//
+// 2. BASE 10 LIVES IN GLOBAL MEMORY, NOT SHARED.  With base 10 resident the
+//    block needs 34,800 bytes, so two resident blocks need 69,600 and force the
+//    100 KB shared carveout on Ada, leaving only 28 KB of L1 out of the 128 KB
+//    unified cache. Dropping it to __ldg brings the block to 24,688 / 49,376 for
+//    two, which fits the 64 KB carveout and leaves ~62 KB of L1 for every other
+//    table plus the 6.33 MB wheel. Base 10 is reached by ~0.6% of warp
+//    iterations, so the traded-away residency costs almost nothing. Measured
+//    1733 against 1711, +1.3%. Confirmed in the profile: Shared Memory
+//    Configuration Size 65.54 KB.
+//
+// 3. THE DS*_HI CHAIN IS PINNED (see dsPinRegister).  ptxas insists on
+//    rematerialising one masked-popcount pair inside the inner loop, because
+//    `hi` is the high half of the candidate register pair and so is free to
+//    re-read. Pinning DS2_HI alone moved the work to DS4_HI for no net change
+//    (+0.17%); pinning both moved it to DS8_HI (+1.14%, at IDENTICAL instruction
+//    count -- the gain was purely getting it off the critical path feeding the
+//    first branch); pinning all five stopped it (+2.43%). Registers fell 31 -> 27
+//    in the process: the recompute was not saving a register, it was costing four.
+//
+// 4. SURVIVORS ARE EMITTED INSIDE THE CASCADE, NOT VIA A FLAG.  The old
+//    `bool pass` plus `if (pass)` after the do/while(0) measured 4.00 instructions
+//    per inner iteration and 12.98% of all warp stall samples. Emitting directly
+//    is identical in behaviour because every break above already skips it.
+//    Measured 1947 against 1732: +12.4%, the largest single win in the kernel.
+//
+// 5. DEAD END -- 32-BIT TRIP COUNT for the inner loop, replacing
+//    `while (candidate < hi_limit)`. Removes ~3 instructions per iteration at the
+//    cost of one divide per outer iteration, amortised 171.8:1. Measured twice:
+//    1687 against 1732 (-2.6%) and 1978 against 2038.71 (-2.98%). The second run
+//    came after ~750M instructions and four registers had been freed and after
+//    the loop condition had itself grown 50% -- conditions that should have
+//    favoured it far more. The compare is genuinely free: it issues in slots the
+//    warp is already stalled on, so its 7-9% stall attribution is warps queueing
+//    at the loop back-edge, not the compare costing anything.
+//
+// The rule all of this produced: stall samples on a COMPUTATION line mean the
+// dependency chain is stalling and are worth acting on; stall samples on a loop
+// tail or back-edge mean warps are queueing there and will simply queue somewhere
+// else if you remove the instructions.
 // ---------------------------------------------------------------------------
-
-// Run the base 8 filter before the base 16 filter.
-//
-// Base 8 is the stronger filter of the two: measured on wheel survivors at the
-// ~4.25e16 search depth its marginal pass rate is 0.2875 against base 16's
-// 0.4167. Because the cumulative survival entering base 32 is independent of
-// the ordering of the four filters above it, the entire effect lands on the
-// fourth stage: the old order pays base 8's cost at 0.917 warp-reach, the new
-// order pays base 16's cost at ~0.775. Modelled saving is 2.9% of warp
-// instruction slots, and the sign of the change does not depend on the relative
-// cost of the two filters -- putting the stronger filter first wins even when
-// the costs are identical.
-#define DS_B8_BEFORE_B16 0
-
-// Keep the whole DS*_HI chain pinned in registers across the inner loop.
-//
-// The Nsight source view showed `__popc(hi)` executing 214,411,441 times, i.e.
-// 2.01 per INNER iteration, despite being written as an outer-loop invariant.
-// Every other hoisted value behaved (DS4_HI 2.00/outer, DS8_HI 4.00/outer,
-// DS32_HI 8.00/outer, DS16_HI 1.00/outer) -- only this one got sunk, and live
-// registers peak at 19 against the 31 allocated, so it is not register pressure.
-// Half of those 214M instructions are POPC, which runs at 16 results/clk/SM on
-// sm_89 against 64 for add/logic/shift, so they cost four times an ordinary op.
-// The empty asm makes the value opaque to ptxas and blocks the rematerialisation.
-//
-// MEASURED, in three rounds: 1735 against a 1732 baseline, and 1950 against
-// 1947 with DS_DIRECT_EMIT on -- +0.17% both times, i.e. nothing.
-//
-// The re-profile explained why, and it is worth recording. Pinning DS2_HI worked
-// exactly as intended: that line dropped from 214,411,441 instructions (2.01 per
-// INNER iteration) to 622,085 (1.00 per outer). But DS4_HI, which derives from it,
-// went the other way -- from 1,244,170 (2.00 per outer) to 215,033,526 (2.01 per
-// inner). Totals 215.6M before, 215.6M after: ptxas relocated the identical
-// rematerialisation one step down the derivation chain rather than giving it up.
-//
-// The reason it keeps doing this is that `hi` is the high half of the candidate
-// register pair, so it is free to re-read, and ptxas does not model POPC as the
-// quarter-rate instruction it is on sm_89. Recomputing looks cheap to it.
-//
-// Pinning DS2_HI and DS4_HI together then moved it a THIRD time, onto DS8_HI
-// (2,488,340 -> 216,277,696, i.e. 4.00 per outer becoming 2.02 per inner). Total
-// instructions were identical across that change -- 3.8731e9 against 3.8725e9 --
-// yet throughput rose 1.14% (1967.95 -> 1990.43) and stall samples fell 9.5%.
-//
-// That is the useful result: the gain had nothing to do with how much work there
-// is and everything to do with where it sits. DS4_HI feeds ds4, the top stall line,
-// on the critical path to the FIRST branch, executed by every lane every iteration.
-// DS8_HI feeds the base 8 filter, further down. Relocating the recompute off the
-// critical chain was worth 1.14% at zero instruction cost.
-//
-// ptxas will recompute exactly one masked-popcount pair inside the loop no matter
-// which variable it takes it from -- it is freeing a single register, and `hi` is
-// the high half of the candidate pair so re-reading it is free. The only way to
-// stop it is to make every link opaque, which is what this does.
-#define DS_PIN_HI_CHAIN 1
-
-// Emit surviving candidates from inside the filter cascade instead of setting a
-// flag and testing it afterwards.
-//
-// `if (pass)` measured 4.00 instructions per inner iteration and 12.98% of all
-// warp stall samples -- third largest in the kernel -- for what is nominally a
-// boolean test. That is the flag init, the set, the test, the branch and the
-// reconvergence bookkeeping. The break statements already skip the tail of the
-// do/while(0), so emitting there is identical in behaviour.
-//
-// MEASURED: 1947 against a 1732 baseline -- +12.4%, the largest single win since
-// high-word hoisting. Note this exceeded the 9.50% instruction share, matching the
-// 12.98% STALL share instead: on an issue-limited kernel, removing stalls pays more
-// than removing instructions.
-#define DS_DIRECT_EMIT 1
-
-// Drive the inner loop from a 32-bit trip count instead of a 64-bit comparison.
-//
-// `while (candidate < hi_limit)` measured 4.02 instructions per inner iteration
-// (the ISETP.GE.U32 / IMAD.EX / ISETP.GE.U32 / AND sequence) and 7.36% of stall
-// samples. The trip count is computed once per outer iteration and amortised
-// over 171.8 inner iterations. Note this is NOT the documented two-halves dead
-// end: the candidate stays a single 64-bit value, so every digit-sum path is
-// untouched and only the loop condition changes.
-//
-// MEASURED TWICE, both regressions. Do not retry this.
-//   1687 against a 1732 baseline  (-2.6%)
-//   1978 against a 2038.71 baseline (-2.98%)
-//
-// The second test was run after DS_DIRECT_EMIT and DS_PIN_HI_CHAIN had removed
-// ~750M instructions and four registers, and after the loop condition itself had
-// grown from 4.02 to 6.02 instructions per iteration -- i.e. under conditions that
-// should have favoured it far more than the first test. Same sign, same magnitude.
-//
-// The 64-bit compare is genuinely free: it issues in slots the warp is stalled on
-// anyway, so its 7-9% stall attribution is warps queueing at the loop back-edge,
-// not the compare costing anything. Replacing free instructions with a divide on
-// the critical path loses every time. Kept at 0 and retained only so the result
-// stays reproducible.
-#define DS_TRIP_COUNTER 0
-
-// Keep the base 10 lookup table in shared memory.
-//
-// With base 10 resident the block's shared footprint is 34,928 bytes, so two
-// resident blocks need 69,856 and force the 100 KB shared carveout on Ada,
-// leaving only 28 KB of L1 out of the 128 KB unified cache. Dropping base 10 to
-// global __ldg brings the block to 24,816 bytes / 49,632 for two, which fits the
-// 64 KB carveout and more than doubles L1 to 64 KB for every other table plus
-// the 6.33 MB wheel. Base 10 is reached by only ~0.8% of warp-iterations, so the
-// traded-away shared residency is worth roughly 0.04 global loads per
-// warp-iteration against a 2.3x larger L1.
-#define DS_B10_IN_SHARED 0
 
 // Helper function to format large integers with commas
 std::string formatCommas(uint64_t num)
@@ -650,14 +593,13 @@ __device__ uint32_t d_wheel[WHEEL_COUNT];
 // Emits no instructions -- the empty asm has no PTX in it at all. The "+r"
 // constraint simply declares the value as both read and written by an opaque
 // operation, which stops ptxas deciding to recompute it inside the inner loop
-// instead of keeping it live. See DS_PIN_HI_CHAIN for why that matters here and
-// what it measured.
+// instead of keeping it live. See note 3 at the top of the file for why that
+// matters here and what it measured.
 //
 // Encapsulated for three reasons: the kernel body stays free of inline assembly,
 // the pinned expressions are written once instead of once per preprocessor arm
 // (they previously had to be kept in sync by hand), and there is a single place
-// to change if a future toolkit stops needing this. With DS_PIN_HI_CHAIN at 0
-// every call compiles to nothing at all.
+// to change if a future toolkit stops needing this.
 __device__ __forceinline__ void dsPinRegister(uint32_t &v)
 {
 	// __INTELLISENSE__ is defined only by the Microsoft IntelliSense engine, never by
@@ -665,35 +607,12 @@ __device__ __forceinline__ void dsPinRegister(uint32_t &v)
 	// the MSVC __asm block form) and flags the colon as "expected a ')'". Hiding the
 	// statement from it removes the squiggle in VS Code and Visual Studio without
 	// changing a single byte of what nvcc or clang actually compile.
-#if DS_PIN_HI_CHAIN && !defined(__INTELLISENSE__)
+#if !defined(__INTELLISENSE__)
 	asm("" : "+r"(v));
 #else
 	(void)v;
 #endif
 }
-
-// Base 8 filter body.
-//
-// Braced rather than do/while(0) on purpose: `break` has to target the enclosing
-// filter cascade, and a do/while wrapper would swallow it.
-#define DS_FILTER_BASE8()                                                     \
-	{                                                                       \
-		const uint32_t ds8 = DS8_HI + pc_lo + __popc(lo & 0x92492492u) +  \
-					   3u * __popc(lo & 0x24924924u);               \
-		if (!local_sp[ds8])                                               \
-			break;                                                      \
-	}
-
-// Base 16 filter body. Nibble fold, then accumulate straight onto the cached
-// high-word byte sum with a single dp4a.
-#define DS_FILTER_BASE16()                                                       \
-	if constexpr (MIN_BASE >= 16)                                              \
-	{                                                                        \
-		const uint32_t n_low = (lo & 0x0F0F0F0F) + ((lo >> 4) & 0x0F0F0F0F); \
-		const uint32_t ds16 = __dp4a(n_low, 0x01010101U, DS16_HI);           \
-		if (!local_sp[ds16])                                                 \
-			break;                                                       \
-	}
 
 // This is the GPU kernel that filters candidate numbers
 // It's templated on minimum base to remove rendundant base checks at lower bases
@@ -732,16 +651,13 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	uint8_t *const s_sp = s_mem;
 	uint8_t *const s_b12 = s_sp + sp_size;
 	uint8_t *const s_b6 = s_b12 + base12Size16;
-#if DS_B10_IN_SHARED
-	uint8_t *const s_b10 = s_b6 + base6Size16;
-#endif
 
 	// Collaboratively load tables into ultra-fast L1 Shared Memory
-	// Only bases 12 and 6 (and optionally 10, see DS_B10_IN_SHARED) are promoted
-	// to shared memory here -- these were empirically confirmed to be the
-	// highest-traffic filters worth the shared memory budget; the small-primes
-	// table is also promoted since every base check indexes into it. The
-	// remaining bases stay in global memory and are read through __ldg().
+	// Only bases 12 and 6 are promoted to shared memory -- the highest-traffic
+	// filters that fit the budget, plus the small-primes table since every base
+	// check indexes into it. Everything else, base 10 included, stays in global
+	// memory and is read through __ldg(). See note 2 at the top of the file for
+	// why base 10 is deliberately excluded.
 	// Scoped to allow const parameters on iterators and pointers
 	{
 		uint4 *const shared = (uint4 *)s_sp;
@@ -759,16 +675,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 			__pipeline_memcpy_async(&shared[i], &global[i], 16);
 	}
 
-#if DS_B10_IN_SHARED
-	{
-		uint4 *const shared = (uint4 *)s_b10;
-		const uint4 *const global = (const uint4 *)b10;
-		const uint32_t words = base10Size16 >> 4;
-		for (uint32_t i = threadIdx.x; i < words; i += blockDim.x)
-			__pipeline_memcpy_async(&shared[i], &global[i], 16);
-	}
-#endif
-
 	{
 		uint4 *const shared = (uint4 *)s_b12;
 		const uint4 *const global = (const uint4 *)b12;
@@ -781,12 +687,6 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 	const uint8_t *__restrict__ const local_sp = s_sp;
 	const uint8_t *__restrict__ const local_b12 = s_b12;
 	const uint8_t *__restrict__ const local_b6 = s_b6;
-#if DS_B10_IN_SHARED
-	const uint8_t *__restrict__ const local_b10 = s_b10;
-#define DS_B10_LOOKUP(idx) (local_b10[(idx)])
-#else
-#define DS_B10_LOOKUP(idx) (__ldg(&b10[(idx)]))
-#endif
 
 	// Calculate global thread mapping for the prime wheel
 	const uint64_t global_id = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -817,14 +717,14 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// corresponding 64-bit mask in the original kernel.
 
 		// Base 2: popcount of the high word.
-		// See DS_PIN_HI_CHAIN -- without the barrier ptxas sinks this back into the
-		// inner loop and re-runs a quarter-rate POPC on every candidate.
+		// Without the barrier ptxas sinks this back into the inner loop and re-runs
+		// a quarter-rate POPC on every candidate. See note 3 at the top of the file.
 		uint32_t DS2_HI = __popc(hi);
 		dsPinRegister(DS2_HI);
 
 		// Base 4: ds4 = ds2 + (count of set bits in odd positions).
-		// Pinned as well -- see DS_PIN_HI_CHAIN. With only DS2_HI opaque, ptxas simply
-		// moved the rematerialisation here instead, for no net change.
+		// Pinned as well: with only DS2_HI opaque, ptxas simply moved the
+		// rematerialisation here instead, for no net change.
 		uint32_t DS4_HI = DS2_HI + __popc(hi & 0xAAAAAAAAu);
 		dsPinRegister(DS4_HI);
 
@@ -858,28 +758,10 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// -----------------------------------------------------------------
 		// INNER LOOP: only the low 32 bits vary.
 		// -----------------------------------------------------------------
-#if DS_TRIP_COUNTER
-		// hi_limit - candidate is at most 2^32 (candidate >= hi << 32 and
-		// hi_limit <= (hi + 1) << 32), so delta - 1 always fits a uint32 and the
-		// divide narrows to 32 bits. stride is validated < 2^32 on the host.
-		const uint32_t delta_m1 = (uint32_t)(hi_limit - candidate - 1ULL);
-		const uint32_t n_iter = delta_m1 / (uint32_t)stride + 1u;
-
-		for (uint32_t k = 0; k < n_iter; k++)
-		{
-			const uint32_t lo = (uint32_t)candidate;
-			const uint32_t pc_lo = __popc(lo);
-
-#else
 		while (candidate < hi_limit)
 		{
 			const uint32_t lo = (uint32_t)candidate;
 			const uint32_t pc_lo = __popc(lo);
-#endif
-
-#if !DS_DIRECT_EMIT
-			bool pass = false;
-#endif
 
 			// Check digit sum primality
 			// Base order is optimal for filter strength and check cost
@@ -896,16 +778,25 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 				if (!(local_sp[p] & local_sp[ds4]))
 					break;
 
-				// Base 8 and base 16, in whichever order DS_B8_BEFORE_B16 selects.
-				// Base 8 is the stronger filter, so running it first shrinks the
-				// warp-reach of everything below it.
-#if DS_B8_BEFORE_B16
-				DS_FILTER_BASE8()
-				DS_FILTER_BASE16()
-#else
-				DS_FILTER_BASE16()
-				DS_FILTER_BASE8()
-#endif
+				// Base 16 -- nibble fold, then accumulate straight onto the cached
+				// high-word byte sum with a single dp4a. No POPC anywhere in this
+				// chain, which is why it runs before base 8 (see note 1 at the top).
+				if constexpr (MIN_BASE >= 16)
+				{
+					const uint32_t n_low = (lo & 0x0F0F0F0F) + ((lo >> 4) & 0x0F0F0F0F);
+					const uint32_t ds16 = __dp4a(n_low, 0x01010101U, DS16_HI);
+					if (!local_sp[ds16])
+						break;
+				}
+
+				// Base 8 -- two masked popcounts, so 4x the ALU cost of base 16
+				// despite being the stronger filter.
+				{
+					const uint32_t ds8 = DS8_HI + pc_lo + __popc(lo & 0x92492492u) +
+								 3u * __popc(lo & 0x24924924u);
+					if (!local_sp[ds8])
+						break;
+				}
 
 				// Base 32
 				if constexpr (MIN_BASE >= 32)
@@ -1007,26 +898,26 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 					uint32_t sum = 0;
 					uint64_t r64 = v_hi;
 					uint64_t rq64 = r64 / 10000ULL;
-					sum += DS_B10_LOOKUP(r64 - rq64 * 10000ULL);
+					sum += __ldg(&b10[r64 - rq64 * 10000ULL]);
 
 					r64 = rq64;
 					uint32_t r = (uint32_t)r64;
 					uint32_t rq = r / 10000U;
-					sum += DS_B10_LOOKUP(r - rq * 10000U);
+					sum += __ldg(&b10[r - rq * 10000U]);
 
 					r = rq;
-					sum += DS_B10_LOOKUP(r);
+					sum += __ldg(&b10[r]);
 
 					r = v_low;
 					rq = r / 10000U;
-					sum += DS_B10_LOOKUP(r - rq * 10000U);
+					sum += __ldg(&b10[r - rq * 10000U]);
 
 					r = rq;
 					rq = r / 10000U;
-					sum += DS_B10_LOOKUP(r - rq * 10000U);
+					sum += __ldg(&b10[r - rq * 10000U]);
 
 					r = rq;
-					sum += DS_B10_LOOKUP(r);
+					sum += __ldg(&b10[r]);
 
 					if (!local_sp[sum])
 						break;
@@ -1298,10 +1189,9 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 
 				// Ran the whole gauntlet without breaking.
 				// (no point using __ballot_sync() since chance of multiple threads passing is tiny)
-#if DS_DIRECT_EMIT
-				// Emit here rather than via a flag: every break above already
-				// skips this, so the behaviour is identical and the per-iteration
-				// flag init / test / branch disappears entirely.
+				// Emitted here rather than via a flag: every break above already
+				// skips this, so behaviour is identical and the per-iteration flag
+				// init / test / branch disappears. Worth 12.4% -- see note 4.
 				{
 					// The counter is deliberately allowed to run past the buffer so
 					// the host can see the true hit count and abort, rather than
@@ -1314,21 +1204,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 						d_results[idx] = candidate;
 					}
 				}
-#else
-				pass = true;
-#endif
 			} while (0);
-
-#if !DS_DIRECT_EMIT
-			if (pass)
-			{
-				uint32_t idx = atomicAdd(d_count, 1);
-				if (idx < MAX_GPU_RESULTS)
-				{
-					d_results[idx] = candidate;
-				}
-			}
-#endif
 
 			// Safe without a wrap test: the host guarantees
 			// end_range <= UINT64_MAX - stride, so candidate < hi_limit <= end_range
@@ -1337,11 +1213,7 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		}
 	}
 
-#undef DS_B10_LOOKUP
 }
-
-#undef DS_FILTER_BASE8
-#undef DS_FILTER_BASE16
 
 // CPU verification worker that checks surviving candidates from the GPU filtering
 void verificationWorker(uint64_t end_block, uint64_t subblock_size, uint32_t max_target_base)
@@ -1775,14 +1647,10 @@ int main(int argc, char **argv)
 	int gridSize = 0;
 
 	// Shared memory footprint. Declared here because the occupancy query below
-	// needs it; it is used again at every kernel launch. See DS_B10_IN_SHARED --
-	// dropping base 10 is what keeps two resident blocks inside the 64 KB
-	// carveout instead of forcing the 100 KB one.
-#if DS_B10_IN_SHARED
-	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16 + base10Size16;
-#else
+	// needs it; it is used again at every kernel launch. Excluding base 10 is what
+	// keeps two resident blocks inside the 64 KB carveout rather than forcing the
+	// 100 KB one -- see note 2 at the top of the file.
 	size_t shared_mem_bytes = sp_bytes + base12Size16 + base6Size16;
-#endif
 
 	// ---- Grid sizing --------------------------------------------------
 	// Two constraints have to be satisfied at once.
@@ -1853,13 +1721,13 @@ int main(int argc, char **argv)
 	// outer iteration.
 	const uint64_t stride = ((uint64_t)gridSize * (uint64_t)blockSize / (uint64_t)WHEEL_COUNT) * WHEEL_MOD;
 
-	// DS_TRIP_COUNTER narrows the inner-loop divide to 32 bits, which requires
-	// stride < 2^32. The largest grid the sizing loop can pick is 16 * gridQuantum,
-	// giving stride = 16 * WHEEL_MOD = 155,195,040, so this always holds -- but it
-	// is a silent correctness precondition, so check it rather than assume it.
-	if (stride == 0ULL || stride > 0xFFFFFFFFULL)
+	// A zero stride would make the inner loop advance nowhere and spin forever, which
+	// is the one failure mode here that produces no output and no error. The grid
+	// sizing above cannot produce it (gridSize >= gridQuantum forces stride >=
+	// WHEEL_MOD), but that is a property of code far from this line, so check it.
+	if (stride == 0ULL)
 	{
-		fprintf(stderr, "FATAL: stride %" PRIu64 " does not fit the 32-bit inner-loop trip count.\n", stride);
+		fprintf(stderr, "FATAL: stride computed as zero -- grid sizing is broken.\n");
 		exit(EXIT_FAILURE);
 	}
 
@@ -1891,12 +1759,7 @@ int main(int argc, char **argv)
 	printf(" Execution Grid Topology: %d blocks x %d threads\n", gridSize, blockSize);
 	printf(" Shared Memory: %zu bytes/block (%zu for %d resident)\n",
 		 shared_mem_bytes, shared_mem_bytes * (size_t)blocksPerSM, blocksPerSM);
-	printf(" Filter Order: base 8 %s base 16, base 10 in %s\n",
-		 DS_B8_BEFORE_B16 ? "before" : "after", DS_B10_IN_SHARED ? "shared" : "global");
-	printf(" Inner Loop: DS*_HI chain %s, %s emit, %s loop condition\n",
-		 DS_PIN_HI_CHAIN ? "pinned" : "unpinned",
-		 DS_DIRECT_EMIT ? "direct" : "flagged",
-		 DS_TRIP_COUNTER ? "32-bit trip count" : "64-bit compare");
+	printf(" Inner Loop: base 16 before base 8, base 10 in global, DS*_HI pinned, direct emit\n");
 	printf(" Campaign Scope Targets: Bases %u to %u\n", global_minbase.load(), max_target_base);
 	printf("====================================================\n");
 
