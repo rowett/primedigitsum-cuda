@@ -2,7 +2,7 @@
 
 A high-performance CUDA program that searches for **ds(n)** numbers: the smallest prime whose digit sum in every base from 2 through n+1 is also prime.
 
-Searches approximately **1.72 trillion numbers per second** on an RTX 4070.
+Searches approximately **2.04 trillion numbers per second** on an RTX 4070.
 
 ---
 
@@ -47,7 +47,9 @@ The GPU kernel applies a fast multi-base digit-sum primality filter to reject th
 
 **Stage 2 — CPU Verification**
 
-A dedicated CPU worker thread receives GPU survivors and performs full Miller-Rabin primality testing plus any remaining base checks above the GPU's filter range. Confirmed primes that set new ds(n) records are logged immediately. Verification takes under 2 ms per sub-block, roughly 20× faster than the GPU produces work, so the CPU is never the bottleneck.
+A dedicated CPU worker thread receives GPU survivors and performs full Miller-Rabin primality testing plus any remaining base checks above the GPU's filter range. Confirmed primes that set new ds(n) records are logged immediately. Verification takes 1–5 ms per dispatch against roughly 1000 ms of GPU work, so the CPU has about three orders of magnitude of headroom and is never remotely the bottleneck.
+
+That gap is the design working, not capacity going to waste. A CPU-only version of the same search on a Ryzen 9 3950X measured the RTX 4070 at **860× a single CPU thread**; allowing for all 16 cores and SMT, the whole CPU is worth about 2% of GPU throughput. Nor can the CPU usefully pre-compute anything: the GPU consumes 3.5e11 wheel candidates per second, so even a one-bit hint per candidate would need 43.7 GB/s against ~25 GB/s of PCIe 4.0 — and producing that bit would require the CPU to do GPU-scale work at 2% of the rate.
 
 ---
 
@@ -91,9 +93,22 @@ Resident block count is queried with `cudaOccupancyMaxActiveBlocksPerMultiproces
 | RTX 4070 | 46 | 92 | 4320 | 99.907% | 19,399,380 | 221 |
 | RTX 5070 Ti | 70 | 140 | 4320 | 99.539% | 19,399,380 | 221 |
 
-### High-Word Hoisting
+### Instruction Economics: POPC is Quarter-Rate
 
-The dominant cost in this kernel is `POPC`, which on Ada runs at **16 results per SM per clock** against 64 for ordinary INT32 — quarter rate, or 8 cycles per warp instruction against 2. Reducing the number of popcount instructions is worth more than almost anything else.
+Almost every design decision below follows from one hardware fact. On sm_89 the SM has 128 FP32 lanes but only 64 that execute INT32, and a handful of instructions run at a quarter of *that*:
+
+| class | instructions | results / clk / SM |
+|---|---|---|
+| FP32 | add, mul, FMA | 128 |
+| **INT32 baseline** | IADD3, IMAD, LOP3, SHF, ISETP, **IDP4A** | **64** |
+| **quarter rate** | **POPC**, FLO, BREV | **16** |
+| SFU | rcp, rsqrt, log2, exp2, sin, cos | 16 |
+
+A warp-wide `POPC` occupies its scheduler partition for 8 cycles against 2 for an `IADD3`. In the current kernel popcount is **9.7% of the instruction count but 30.1% of the ALU issue cost**, so a naive instruction count understates the real cost by 1.29×.
+
+This is why base 16 runs *before* base 8 despite being the weaker filter, why `__dp4a` is used wherever a horizontal sum will do, and why hoisting popcounts out of the inner loop was the single largest early win. The kernel issues no SFU instructions at all — there is no floating point in it.
+
+### High-Word Hoisting
 
 The candidate walk is therefore a two-level loop. The outer loop pins the top 32 bits of the candidate; the inner loop varies only the low 32 bits. Because the stride is about 19.4 million, `candidate >> 32` changes only once every ~221 inner iterations, so the high half's contribution to all five power-of-two digit sums is loop-invariant and gets computed once in the outer loop.
 
@@ -122,6 +137,8 @@ Remaining odd:   5, 9, 3, 11, 7, 13, 15
 
 The do-while/break structure provides early exit as soon as any base check fails. Divergence is inherent and structural: a warp pays the full instruction latency for any filter that even one of its 32 lanes still needs, so the effective cost of each filter is its instruction count weighted by the probability that at least one lane survives to reach it.
 
+**Base 16 runs before base 8, and this is counter-intuitive.** Base 8 is the stronger filter — marginal pass rate 0.2875 against base 16's 0.4167 — so filter-strength reasoning says it should go first. Running it first was measured and lost 1.3%. The reason is the POPC table above: base 8 is 2 LOP3 + **2 POPC** + IMAD + 2 IADD ≈ 13 ALU-equivalents, while base 16 is 2 LOP3 + SHF + IADD + **DP4A with no POPC at all** ≈ 5. Base 8 costs 2.6× as much, which swamps its extra filtering power. Ordering by strength alone is wrong here; ordering by strength *per unit of weighted cost* gives the order shown.
+
 Measured over 10.26 M real post-wheel candidates at the current search depth:
 
 | filter | candidates reaching | **warps** reaching |
@@ -138,6 +155,10 @@ Measured over 10.26 M real post-wheel candidates at the current search depth:
 | 5, 9, 3, 11, 7, 13, 15 | — | all under 0.08% |
 
 Four of the 10.26 M cleared all sixteen filters, a survival rate of 3.9e-7.
+
+> **These rates are depth-dependent, and locally very noisy.** Within a 2³² window the high bits are fixed, so `ds2 = popc(hi) + popc(lo)` carries a constant offset that shifts the whole popcount distribution relative to the primes near it. Measured across fourteen adjacent windows at the current depth, the base-2 pass rate ranges from 18.5% to 31.2% and the post-base-6 survival rate varies by **8×** — driven purely by `popcount(hi)`. Each dispatch spans ~465 windows, which averages that down to the ~1.65× spread visible in per-dispatch candidate counts. Any A/B comparison must therefore use a fixed block range, or the window effect will swamp the change being measured.
+
+Base 32 is the strongest single filter in the cascade: **4.5×** on the final output, stable from 10¹⁴ to 10¹⁷. Standalone it culls 5.6×, so it loses about 20% of its power to correlation with the filters around it — all sixteen digit sums are functions of the same bit pattern. There is an exact reason for that correlation: casting out nines generalises to ds_b(n) ≡ n (mod b−1), so every digit sum is pinned to n's residues. A corollary is that any candidate divisible by 31 can only pass base 32 if its digit sum is exactly 31 — verified over 642,148 samples, none passed.
 
 Two things follow. The power-of-two prefix is effectively the entire kernel — bases 2/4, 8, and 32 dominate the cycle budget, and all three sit at their instruction floor. And the ordering beyond the powers of two is settled: base 12 leads the remaining group because it is simultaneously the cheapest (5 chunk lookups against base 6's 7) and the strongest (19.2% pass rate against base 6's 25.1%), and everything after base 10 is reached by fewer than one warp in three hundred. Reordering there is unmeasurable.
 
@@ -185,19 +206,58 @@ if (!(local_sp[p] & local_sp[ds4])) break;
 ```
 Fusing them is deliberate rather than incidental. Splitting the two checks would save nothing — with a measured base-2 pass rate of 29.9%, the probability that at least one of 32 lanes survives is 99.99%, so the base-4 instructions would be issued anyway. Fusing at least buys instruction-level parallelism between the two independent popcounts.
 
-### Shared Memory
+### Shared Memory and the Carveout Boundary
 
-The small-prime lookup table (`local_sp`) and the three most-reached non-power-of-2 tables (base 6, base 10, base 12) are staged into shared memory via `__pipeline_memcpy_async`. The remaining tables (bases 3, 5, 7, 9, 11, 13, 14, 15) are read with `__ldg`.
+The small-prime lookup table (`local_sp`) and the two most-reached non-power-of-2 tables (base 6 and base 12) are staged into shared memory via `__pipeline_memcpy_async`. Everything else — bases 3, 5, 7, 9, 10, 11, 13, 14, 15 — is read with `__ldg`.
 
-`local_sp` is small enough that the ~45 entries actually indexed span about 12 distinct 32-bit words. Sub-word accesses to the same word broadcast rather than conflict, so 32 lanes land in 12 distinct banks with zero replays.
+**Base 10 is deliberately excluded, and the reason is the carveout boundary rather than the table itself.** With base 10 resident the block needs 34,800 bytes, so two resident blocks need 69,600 — over the 64 KB line, which forces Ada's 100 KB shared carveout and leaves only 28 KB of L1 out of the 128 KB unified cache. Dropping base 10 to global brings the block to **24,688 bytes / 49,376 for two**, which fits the 64 KB carveout and leaves ~62 KB of L1 for every other table plus the 6.33 MB wheel. Base 10 is reached by ~0.6% of warp-iterations, so the residency given up costs almost nothing. Measured +1.3%, and confirmed in the profile as `Shared Memory Configuration Size 65.54 KB`.
+
+`local_sp` is small enough that the entries actually indexed span about 12 distinct 32-bit words. Sub-word accesses to the same word broadcast rather than conflict, so 32 lanes land in distinct banks with essentially zero replays — measured at **1.000-way mean conflict degree**. Padding the table to `uint32_t` would make this *worse* (1.267-way), since spreading indices over 4× the address range puts more distinct words in the same bank.
+
+The `extern __shared__` block is declared as `uint4` rather than `uint8_t` so its 16-byte alignment comes from the type system: the loaders issue 16-byte `__pipeline_memcpy_async` stores into it, and a misaligned 16-byte shared store is an illegal-address abort rather than a slow path.
+
+### Pinning the Loop Invariants
+
+Hoisting the `DS*_HI` partial sums into the outer loop is only half the job — ptxas will quietly undo it. Profiling showed `__popc(hi)` executing **214,411,441 times, or 2.01 per *inner* iteration**, despite being written as an outer-loop invariant. It was rematerialising the value inside the loop, and half of those instructions were quarter-rate POPC.
+
+The cause is that `hi` is the high half of the candidate register pair, so re-reading it is free and recomputing from it looks cheap to a cost model that does not know POPC is quarter-rate. The fix is an empty inline asm that makes the value opaque:
+
+```cuda
+__device__ __forceinline__ void dsPinRegister(uint32_t &v)
+{
+    asm("" : "+r"(v));   // no instructions; just blocks rematerialisation
+}
+```
+
+**The whole chain has to be pinned as a unit.** Pinning `DS2_HI` alone worked exactly as intended — that line fell to 1.00 per outer iteration — but ptxas simply relocated the identical work onto `DS4_HI` for zero net change. Pinning both moved it to `DS8_HI`. Only pinning all five stopped it. The three rounds measured +0.17%, +1.14% and +2.43%.
+
+Two results from this are worth keeping. The +1.14% round came at an **identical instruction count** — 3.8731e9 against 3.8725e9 — because the gain was entirely in moving the recompute off the critical path feeding the first branch. And pinning five extra values *reduced* register usage from 31 to 27: the rematerialisation was not saving a register, it was costing four, since `hi` and the intermediate masks had to stay live to recompute from.
+
+### Direct Emission
+
+Survivors are emitted from inside the filter cascade rather than via a flag tested afterwards. The earlier form —
+
+```cuda
+bool pass = false;
+do { ... pass = true; } while (0);
+if (pass) { /* emit */ }
+```
+
+— measured **4.00 instructions per inner iteration and 12.98% of all warp stall samples**, third-largest in the kernel, for what is nominally a boolean test. Every `break` in the cascade already skips the tail of the `do {} while (0)`, so emitting there is identical in behaviour and the flag's init, set, test, branch and reconvergence bookkeeping all disappear.
+
+**Worth +12.4%** — the largest single optimisation in the kernel since high-word hoisting.
 
 ### Result Output
 
 Survivors are written with a plain per-thread `atomicAdd` on the result counter. Warp aggregation via `__ballot_sync` was considered and rejected: at a measured survival rate of 3.9e-7 the probability of two lanes in the same warp surviving simultaneously is negligible, so the aggregation logic would cost more than the contention it removes.
 
+The counter is deliberately allowed to run past the buffer capacity so the host can see the true hit count and abort, rather than saturating and reporting a full buffer as a normal result.
+
 ### Kernel Templating
 
-The kernel is templated on `MIN_BASE` and instantiated at compile time for values 9 through 16 plus 32. `if constexpr` blocks for higher bases compile away entirely in lower-base instantiations. Register usage ranges from 26 to 32 across all variants with zero spill, comfortably inside the 42-register budget that two resident blocks of 768 threads allows.
+The kernel is templated on `MIN_BASE` and instantiated at compile time for values 9 through 16 plus 32. `if constexpr` blocks for higher bases compile away entirely in lower-base instantiations. Register usage ranges from **24 to 27** across all variants with zero spill, comfortably inside the 40-register budget that two resident blocks of 768 threads allows (65536 / 1536 = 42.67, rounded down to the 8-register allocation granularity).
+
+Because the kernel is only instantiated at a few `MIN_BASE` values, the value actually compiled in is not always the campaign's current minbase — a campaign at minbase 31 runs the `MIN_BASE=16` instantiation. The launch dispatcher and the CPU verifier both route through a single `instantiatedMinBase()` function so they cannot disagree about which bases the GPU checked. If they ever did, the verifier would skip a base the kernel never looked at and the run would emit a **false record** with nothing to detect it.
 
 ---
 
@@ -208,6 +268,24 @@ The Miller-Rabin primality test uses deterministic witness sets sufficient for a
 When a candidate passes all base checks and primality testing, it claims any newly validated ds(n) records via a compare-exchange loop on `global_minbase`, then continues checking higher bases to potentially claim additional consecutive records from the same candidate.
 
 > `global_minbase` holds a **base**, not an n. The convention throughout is base = n + 1, which is why records are logged as `claim_base - 1`.
+
+Ordering matters for correctness, not just tidiness: ds(n) is defined as the *smallest* prime with the property, so survivors are sorted within each payload and payloads are processed strictly FIFO by a single worker. Dispatches that produce no candidates still queue an empty payload, which keeps the heartbeat advancing through the long barren stretches at high minbase.
+
+---
+
+## Robustness
+
+Failure modes that produce wrong answers silently are treated as more dangerous than crashes, since a record search that quietly skips a range is unrecoverable and undetectable.
+
+- **Result-buffer overflow is fatal, not truncating.** If the GPU emits more than `MAX_GPU_RESULTS`, the run aborts naming the sub-block rather than clamping and reporting success on a range it never fully examined.
+- **`cudaGetLastError()` after every launch.** A failed launch would otherwise leave the count at its memset zero, queue no payload, and let the dispatch loop advance as though the range simply held no candidates — then checkpoint it as done.
+- **Range validation against 64-bit wrap.** `end_block × subblock_size` is bounded by `UINT64_MAX − stride` before the loop starts, which is what lets the inner walk use a bare `candidate += stride` with no wrap test on the hot path.
+- **Strict argument parsing.** An unchecked `strtoull` turns a typo into a silent zero, and a zero `subblock_size` makes the whole campaign a no-op that still reports success.
+- **Deterministic Miller-Rabin.** Witnesses 2 through 37 are deterministic to ~3.19e24, well past 2⁶⁴ — there is no probabilistic gap anywhere in the searched range.
+
+### Verification
+
+The kernel's arithmetic has been differentially tested against naive digit sums: 600k values across the five power-of-two SWAR decompositions, 122k values × 11 bases across the radix-chunk paths including every `uint32_t` narrowing, and 1.08 billion candidates through the real `MIN_BASE=32` kernel at live search depth. A cold-start run reproduced ds(1) through ds(31) from zero, and ds(1) through ds(21) have been confirmed minimal by exhaustive brute force.
 
 ---
 
@@ -220,11 +298,33 @@ When a candidate passes all base checks and primality testing, it claims any new
 | wheel-510510 | 1602.71 G/s | ×1.032 |
 | wave-aligned grid | 1631.25 G/s | ×1.018 |
 | wheel-9699690 | 1721.26 G/s | ×1.050 |
-| | | **×1.512 cumulative** |
+| base 10 → global (64 KB carveout) | 1733 G/s | ×1.013 |
+| direct emission | 1947 G/s | ×1.124 |
+| DS\*_HI chain pinned | 2042.08 G/s | ×1.049 |
+| | | **×1.794 cumulative** |
 
-RTX 5070 Ti (70 SMs, sm_120) reached **2809.33 G/s** on the mod-510510 build, or 1.722× the 4070 at that same revision. Of that, 1.522× is SM count alone; the per-SM architectural gain is only about 1.13× despite Blackwell's unified INT32/FP32 cores doubling plain integer throughput, which is consistent with `POPC` not having scaled with them.
+Final figure verified over a 312.60 s sustained run, not a short benchmark. Run-to-run variance on a fixed block range is **0.27%**.
+
+RTX 5070 Ti (70 SMs, sm_120) reached **3042.43 G/s** on the mod-9699690 build, before any of the last three optimisations above. Normalised per SM per clock the two cards differ by only 1.15× despite Blackwell unifying INT32 with FP32 and doubling plain integer throughput — almost all of the observed gap is SM count. That is consistent with the kernel being **instruction-issue bound rather than ALU bound**: issue is 4 warp-instructions/clk/SM on both architectures, and widening a pipe that is only 66% utilised buys very little.
 
 Under load on the RTX 4070 the core clock holds a steady 2760 MHz at 173–178 W against a 200 W board limit and 74–75 °C, with SM activity at 100% and **memory bandwidth utilisation at 0–1%**. The kernel is instruction-issue bound, not memory bound, and is neither power- nor thermally throttled.
+
+### Profile summary (final build)
+
+| metric | value |
+|---|---|
+| SM throughput | 86.84% |
+| top pipeline | ALU, 66.1% |
+| memory pipes busy | 58.16% |
+| DRAM throughput | 0.52% |
+| executed IPC | 3.24 / 4 |
+| issued warps per scheduler | 0.87 / 1.0 |
+| theoretical / achieved occupancy | 100% / 96.38% |
+| registers, spills | 27, zero |
+| instructions per inner iteration | 35.00 |
+| active threads per warp | 19.30 / 32 |
+
+The remaining headroom is warp divergence. At 19.3 of 32 lanes active the profiler estimates 36.8% available in principle, but it is structural to the early-exit cascade and has resisted five separate attacks.
 
 ### Validating a change
 
@@ -238,6 +338,18 @@ Documented so they aren't re-attempted:
 - **32-bit inner walk.** Carrying the candidate as two `uint32_t` halves and terminating the inner loop on the carry out of a 32-bit add instead of a 64-bit add plus 64-bit compare. Measured 1% slower: the instruction saving was real, but the 64-bit version has one exit condition feeding one branch where the split version has two, and the deep filters then need the 64-bit value reconstructed.
 - **Larger shared-memory carveout** for the `__ldg` tables. With memory utilisation at 1% there is no bandwidth pressure to relieve.
 - **Reordering the non-power-of-two filters.** Reached by too few warps to measure — see the cascade table above.
+- **Running base 8 before base 16.** Base 8 is the stronger filter, so this looks like a clear win. Measured 1685 against 1711, a 1.3% loss. Base 8's two quarter-rate popcounts make it 2.6× the weighted cost of base 16. Ordering by filter strength alone is the wrong model.
+- **Fusing base 8 and base 16 into one branch,** the way bases 2 and 4 are fused. Fusion forces the second filter up to the first one's warp-reach, so it is only cheap when adjacent filters have similar reach. The gaps here are 0.101 (16→8) and 0.420 (8→32); there is no cheap pair. Bases 2 and 4 fuse for free precisely because both sit at reach 1.000.
+- **32-bit trip count** replacing the 64-bit `while (candidate < hi_limit)`. Removes ~3 instructions per iteration for one divide per outer iteration, amortised 171.8:1. Measured twice — 1687 against 1732 (−2.6%) and 1978 against 2038.71 (−2.98%) — the second time under conditions that should have favoured it far more.
+- **Precomputing anything on the CPU.** Bounded by PCIe, not cleverness: a one-bit-per-candidate hint needs 43.7 GB/s against ~25 GB/s available, and the CPU runs the same cascade at 2% of the GPU's rate.
+
+### The rule these produced
+
+Three of the last six optimisations attempted made the kernel *slower*, and all three failures came from reasoning about instruction counts. The discriminator that actually works:
+
+> **Stall samples on a computation line mean the dependency chain is stalling, and are worth acting on. Stall samples on a loop tail or back-edge mean warps are queueing there, and they will simply queue somewhere else if you remove the instructions.**
+
+`if (pass)` carried 12.98% of stalls on a computation path and removing it gained 12.4%. The loop condition carried 7.36% on a back-edge and removing it lost 2.6% — and after `if (pass)` was deleted, most of its stall share reappeared on `candidate += stride` at an identical instruction count.
 
 ---
 
@@ -248,12 +360,12 @@ Documented so they aren't re-attempted:
 >>> NEW RECORD FOUND: ds(22) = 28,941,023,651 <<<
 ```
 
-`ds_state.txt` — overwritten every 60 seconds with the exact command needed to resume from the last completed sub-block:
+`ds_state.txt` — overwritten every 60 seconds with the exact command needed to resume from the last completed sub-block (the program name is taken from `argv[0]`, so the line is directly runnable):
 ```
 --- ENGINE HEARTBEAT ---
 Last Saved: 2026-05-01 14:32:11
 Restart Command Args:
-.\ds 12501 <end_subblock> <subblock_size> 13 <maxbase>
+<program> 12501 <end_subblock> <subblock_size> 13 <maxbase>
 ```
 
 > Record values now exceed 15 digits. Any tool that keeps only 15 significant figures — Excel, Google Sheets, `%.15g` — will silently truncate them into composite-looking numbers. Read results from the program's own output.
@@ -265,7 +377,7 @@ Restart Command Args:
 - CUDA Toolkit 12.x or later (developed against 13.3.1)
 - C++17 or later for `if constexpr`; built with C++20
 - GPU with compute capability 7.0 or higher (Volta+) for `__dp4a`. `__pipeline_memcpy_async` is available from 7.0 and hardware-accelerated from 8.0. Tested on sm_89 (Ada) and sm_120 (Blackwell)
-- Windows (uses `_umul128` / `_udiv128` for 128-bit arithmetic in Miller-Rabin)
+- Windows or Linux. Miller-Rabin uses `_umul128` / `_udiv128` on MSVC and `unsigned __int128` on GCC/Clang
 - ~7 MB of free device memory for the wheel table, and the same again in host `.bss`
 
 ---
@@ -280,7 +392,9 @@ nvcc -O3 -std=c++20 -lineinfo ^
      -Xptxas "-v" -Xcompiler "/O2 /Ob2 /Ot" ds-cuda.cu -o ds
 ```
 
-Adjust `-gencode` for your GPU (sm_70 for Volta, sm_75 for Turing, sm_86 for Ampere, sm_89 for Ada, sm_120 for Blackwell). The trailing `compute_120` entry embeds PTX for forward compatibility; a single `-arch=sm_89` builds faster if you only ever run locally. `-Xptxas -v` reports register usage; watch that it stays at or below 42, since crossing that drops the second resident block per SM and costs roughly half the throughput.
+Adjust `-gencode` for your GPU (sm_70 for Volta, sm_75 for Turing, sm_86 for Ampere, sm_89 for Ada, sm_120 for Blackwell). The trailing `compute_120` entry embeds PTX for forward compatibility; a single `-arch=sm_89` builds faster if you only ever run locally. `-Xptxas -v` reports register usage; watch that it stays at or below **40**, since crossing that drops the second resident block per SM and costs roughly half the throughput. The current build uses 24–27 with zero spill, so there is headroom for changes that need it.
+
+The one piece of inline assembly in the file is hidden from Microsoft's IntelliSense parser with `#if !defined(__INTELLISENSE__)`, since it cannot parse GCC-style extended asm and flags the colon as a syntax error. This changes nothing about what nvcc or clang compile.
 
 Startup builds the 9.7 M-entry wheel on the host, adding 50–100 ms before the first launch.
 
