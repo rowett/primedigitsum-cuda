@@ -826,12 +826,20 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// INNER LOOP: only the low 32 bits vary.
 		// -----------------------------------------------------------------
 		// Unrolled 3x. The trip count is not known here, so ptxas duplicates the body
-		// with an exit check between copies rather than producing a clean 3x body --
-		// but that still cuts the back-edge branch and the 64-bit `candidate < hi_limit`
-		// compare (6.02 instructions per iteration on its own) to a third, and more
-		// importantly hands the scheduler three fully independent filter cascades to
-		// interleave. The kernel is issue-limited rather than ALU-limited, so shortening
-		// dependency chains is what buys throughput.
+		// with an exit check between copies rather than producing a clean 3x body.
+		//
+		// It does NOT reduce loop control, which is the intuitive explanation and the
+		// wrong one: the profile shows `while (candidate < hi_limit)` still costing 4.02
+		// instructions per candidate and `candidate += stride` still 2.00, both exactly
+		// as before unrolling. Every copy keeps its own exit check.
+		//
+		// The gain is entirely scheduling. Three independent filter cascades give ptxas
+		// work to interleave, and the kernel is issue-limited (0.87 warps/cycle against
+		// a ceiling of 1.0) rather than ALU-limited, so covering dependency latency is
+		// what buys throughput. Measured: total instructions fell only 5.1% (35.00 to
+		// 33.23 per candidate) for a 6.7% throughput gain, and the ds4 line -- the top
+		// stall in the un-unrolled build at 20.55% -- dropped to 13.97% because its
+		// dependency chain now has two other cascades to hide behind.
 		//
 		// Swept against a 2040 unrolled-1 baseline, variance floor 0.27%:
 		//   2x 2142   3x 2176   4x 2144   5x 2125   6x 2132
@@ -843,7 +851,28 @@ __global__ void __launch_bounds__(BLOCK_SIZE, 2) unifiedSearchKernel(
 		// tested several candidates inside ONE cascade and lost early exit. Here each
 		// copy keeps its own cascade and its own breaks, so per-candidate divergence is
 		// unchanged -- which is why the checksum is identical at every unroll factor.
+//
+		// ARCHITECTURE-CONDITIONAL. Measured on both cards over the same pinned range:
+		//
+		//   unroll     none        2        3        4        5
+		//   sm_89   2042.67  2146.96  2179.81  2148.06  2132.10  -> PEAK at 3, +6.7%
+		//   sm_120  3012.01  2794.98  2782.38  2869.89  2863.13  -> TROUGH at 3, -7.6%
+		//
+		// Same extremum point, opposite sign. Blackwell recovers slightly at 4-5 but
+		// never reaches unrolled-1, so there is no factor worth using there.
+		//
+		// Blackwell does not want this at all. The Ada gain is scheduling -- three
+		// independent cascades covering dependency latency -- and sm_120 evidently does
+		// not need the help, so all it gets is the cost: a 3x larger loop body and the
+		// instruction-fetch pressure that comes with it. Same pattern as direct emit,
+		// which is worth +12.4% on sm_89 and +0.08% on sm_120: Ada benefits from
+		// software help with instruction count and ILP, Blackwell absorbs both in
+		// hardware and only pays the downside.
+#if __CUDA_ARCH__ < 1200
 #pragma unroll 3
+#else
+#pragma unroll 1
+#endif
 		while (candidate < hi_limit)
 		{
 			const uint32_t lo = (uint32_t)candidate;

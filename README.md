@@ -237,13 +237,20 @@ Two results from this are worth keeping. The +1.14% round came at an **identical
 
 `#pragma unroll 3` on the inner `while` is worth **+6.7%**. The trip count is not known at that point, so ptxas duplicates the body with an exit check between copies rather than producing a clean 3× body — but that still cuts the back-edge branch and the 64-bit `candidate < hi_limit` compare, which costs 6.02 instructions per iteration on its own, to a third. The larger effect is scheduling: three fully independent filter cascades give the scheduler something to interleave, and the kernel is issue-limited (0.87 warps/cycle against a ceiling of 1.0) rather than ALU-limited, so shortening dependency chains is what actually buys throughput.
 
-The factor was swept rather than guessed, against a 2040 G/s unrolled-1 baseline and a 0.27% variance floor:
+The factor was swept rather than guessed, and repeated on a second session — every point drifted upward by 0.13–0.33% (mean +0.21%, sd 0.069%) with the shape unchanged, so run-to-run variation is a systematic session offset rather than random noise.
 
-| unroll | 1 | 2 | 3 | 4 | 5 | 6 |
-|---|---|---|---|---|---|---|
-| G/s | 2040 | 2142 | **2176** | 2144 | 2125 | 2132 |
+**The optimum is architecture-dependent, and the sign flips:**
 
-2 and 4 differ by two, and 5 and 6 by seven — both inside noise. This is a genuine peak at 3 with everything else on a plateau about 1.5% below, not a curve to round up.
+| unroll | none | 2 | 3 | 4 | 5 |
+|---|---|---|---|---|---|
+| RTX 4070 (sm_89) | 2042.67 | 2146.96 | **2179.81** | 2148.06 | 2132.10 |
+| | — | +5.1% | **+6.7%** | +5.2% | +4.4% |
+| RTX 5070 Ti (sm_120) | **3012.01** | 2794.98 | 2782.38 | 2869.89 | 2863.13 |
+| | — | −7.2% | **−7.6%** | −4.7% | −4.9% |
+
+Ada peaks at 3; Blackwell troughs at 3 and never recovers to unrolled-1. The pragma is therefore guarded on `__CUDA_ARCH__ < 1200`.
+
+This is the second optimisation to behave this way. Direct emit is worth +12.4% on sm_89 and +0.08% on sm_120; unrolling is +6.7% and −7.6%. Both are software compensating for something Ada lacks — wasted integer instructions that Blackwell's unified INT32/FP32 absorbs, and instruction-level parallelism Blackwell does not need supplied. Neither transfers, and unrolling actively costs, since all Blackwell collects is a 3× loop body and the instruction-fetch pressure with it. By contrast the `DS*_HI` pins are worth +3.0% and +1.6% — they remove real quarter-rate popcount work rather than compensating for a microarchitectural weakness, and that transfers.
 
 This is **not** the "two candidates per thread" dead end. That tested two candidates inside a single cascade and lost early exit to intra-thread divergence. Here each unrolled copy keeps its own cascade and its own `break`s, so per-candidate divergence is unchanged.
 
